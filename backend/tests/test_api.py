@@ -1,10 +1,15 @@
 import io
 import json
+import os
 import time
 from fastapi.testclient import TestClient
 from app.main import app, summarize
 from app.sandbox import EvalOutcome
 from app import worker
+
+
+async def _fake_pass(prediction,deps,tests,language='c',**kwargs):
+    return EvalOutcome('TEST_PASS',True,len(tests),len(tests),run_log='mock sandbox unit test')
 
 
 def test_seed_and_endpoint():
@@ -46,9 +51,7 @@ def test_metrics_excludes_infra_errors():
 
 
 def test_async_run_result_persisted(monkeypatch):
-    def fake_eval(prediction,deps,tests):
-        return EvalOutcome('TEST_PASS',True,len(tests),len(tests),run_log='mock sandbox unit test')
-    monkeypatch.setattr(worker,'evaluate_code',fake_eval)
+    monkeypatch.setattr(worker,'evaluate_code_async',_fake_pass)
     with TestClient(app) as client:
         did=next(d['id'] for d in client.get('/api/datasets').json() if d['sample_count']==4)
         mid=next(m['id'] for m in client.get('/api/models').json() if m['kind']=='fixture')
@@ -74,3 +77,145 @@ def test_model_input_not_reference():
             model=db.execute("SELECT * FROM models WHERE kind='fixture'").fetchone()
             sample=db.execute('SELECT * FROM samples LIMIT 1').fetchone()
         assert generate_prediction(model,sample,{})==sample['demo_prediction']
+
+
+def _fixture_ids(client):
+    did=next(d['id'] for d in client.get('/api/datasets').json() if d['sample_count']==4)
+    mid=next(m['id'] for m in client.get('/api/models').json() if m['kind']=='fixture')
+    return did,mid
+
+
+def _wait_for(client,run_id,timeout=15):
+    detail=None
+    for _ in range(int(timeout/0.05)):
+        detail=client.get(f'/api/runs/{run_id}').json()
+        if detail['run']['status'] in ('completed','completed_with_errors','cancelled','interrupted'):
+            return detail
+        time.sleep(0.05)
+    raise AssertionError(f'run {run_id} did not finish: {detail}')
+
+
+def test_delete_finished_run(monkeypatch):
+    monkeypatch.setattr(worker,'evaluate_code_async',_fake_pass)
+    with TestClient(app) as client:
+        did,mid=_fixture_ids(client)
+        rid=client.post('/api/runs',json={'dataset_id':did,'model_id':mid,'sample_limit':1}).json()['run_id']
+        detail=_wait_for(client,rid)
+        result_id=detail['results'][0]['id']
+        assert client.delete('/api/runs/999999').status_code==404
+        resp=client.delete(f'/api/runs/{rid}')
+        assert resp.status_code==200 and resp.json()['deleted']==1
+        assert client.get(f'/api/runs/{rid}').status_code==404
+        assert client.get(f'/api/results/{result_id}').status_code==404
+        assert all(r['id']!=rid for r in client.get('/api/runs').json())
+
+
+def test_delete_active_run_rejected():
+    from app.db import connect, now
+    with TestClient(app) as client:
+        did,mid=_fixture_ids(client)
+        with connect() as db:
+            rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) VALUES(?,?,?,?,?,?)',
+                           (did,mid,'running',1,'{}',now())).lastrowid
+        try:
+            assert client.delete(f'/api/runs/{rid}').status_code==409
+            assert client.get(f'/api/runs/{rid}').status_code==200
+        finally:
+            with connect() as db:
+                db.execute('DELETE FROM runs WHERE id=?',(rid,))
+
+
+def test_delete_finished_runs_bulk(monkeypatch):
+    monkeypatch.setattr(worker,'evaluate_code_async',_fake_pass)
+    from app.db import connect, now
+    with TestClient(app) as client:
+        did,mid=_fixture_ids(client)
+        rid=client.post('/api/runs',json={'dataset_id':did,'model_id':mid,'sample_limit':1}).json()['run_id']
+        _wait_for(client,rid)
+        with connect() as db:
+            active=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) VALUES(?,?,?,?,?,?)',
+                              (did,mid,'queued',1,'{}',now())).lastrowid
+        try:
+            resp=client.delete('/api/runs')
+            assert resp.status_code==200
+            assert resp.json()['deleted']>=1
+            assert client.get(f'/api/runs/{rid}').status_code==404
+            # Queued/running runs must survive a history cleanup.
+            assert client.get(f'/api/runs/{active}').status_code==200
+        finally:
+            with connect() as db:
+                db.execute('DELETE FROM runs WHERE id=?',(active,))
+        assert client.delete('/api/runs').json()['deleted']==0
+
+
+def test_delete_offline_run_cleans_file_and_model(monkeypatch):
+    monkeypatch.setattr(worker,'evaluate_code_async',_fake_pass)
+    with TestClient(app) as client:
+        did,mid=_fixture_ids(client)
+        samples=client.get(f'/api/datasets/{did}/samples').json()
+        payload='\n'.join(json.dumps({'sample_id':s['sample_key'],'prediction':'int f(void){return 0;}'})
+                          for s in samples)
+        files={'file':('preds.jsonl',io.BytesIO(payload.encode()),'application/octet-stream')}
+        resp=client.post('/api/runs/offline',files=files,data={'dataset_id':did,'name':'Offline To Delete'})
+        assert resp.status_code==201,resp.text
+        rid=resp.json()['run_id']
+        detail=_wait_for(client,rid)
+        model_id=detail['run']['model_id']
+        offline_file=detail['run']['config'].get('offline_file')
+        assert offline_file and os.path.isfile(offline_file)
+        assert client.delete(f'/api/runs/{rid}').status_code==200
+        assert not os.path.exists(offline_file)
+        assert all(m['id']!=model_id for m in client.get('/api/models').json())
+
+
+
+def test_summarize_ignores_transient_rows():
+    rows=[
+        {'status':'TEST_PASS','compile_success':1,'tests_passed':2,'tests_total':2},
+        {'status':'GENERATED','compile_success':None,'tests_passed':0,'tests_total':2},
+        {'status':'COMPILING','compile_success':None,'tests_passed':0,'tests_total':2},
+    ]
+    m=summarize(rows)
+    assert m['evaluated']==1 and m['excluded']==2
+    assert m['re']==100.0 and m['tcp']==100.0
+
+
+def test_input_too_long_counts_as_valid_failure():
+    rows=[
+        {'status':'TEST_PASS','compile_success':1,'tests_passed':2,'tests_total':2},
+        {'status':'INPUT_TOO_LONG','compile_success':0,'tests_passed':0,'tests_total':2},
+    ]
+    m=summarize(rows)
+    # It must not be silently excluded, otherwise RE would be inflated.
+    assert m['evaluated']==2 and m['excluded']==0
+    assert m['rc']==50.0 and m['re']==50.0 and m['tcp']==50.0
+
+
+def test_db_migration_is_idempotent():
+    from app import db
+    db.initialize()
+    db.initialize()
+    with db.connect() as conn:
+        result_cols={r[1] for r in conn.execute('PRAGMA table_info(results)')}
+        run_cols={r[1] for r in conn.execute('PRAGMA table_info(runs)')}
+    assert {'inference_ms','compile_ms','test_ms','prompt_tokens',
+            'completion_tokens','prompt_text','generation_params_json',
+            'sandbox_ms','detail_json'} <= result_cols
+    assert 'started_at' in run_cols
+
+
+def test_reference_model_cannot_be_used_as_normal_run():
+    from app.db import connect
+    with TestClient(app) as client:
+        did=next(d['id'] for d in client.get('/api/datasets').json() if d['sample_count']==4)
+        with connect() as db:
+            mid=db.execute("INSERT INTO models(name,kind,created_at) VALUES(?,?,?)",
+                           ('reference-test-model','reference',__import__('app.db',fromlist=['now']).now())).lastrowid
+        try:
+            response=client.post('/api/runs',json={'dataset_id':did,'model_id':mid,'sample_limit':1})
+            assert response.status_code==422
+            assert 'reference-check' in response.text
+            assert all(m['id']!=mid for m in client.get('/api/models').json())
+        finally:
+            with connect() as db:
+                db.execute('DELETE FROM models WHERE id=?',(mid,))

@@ -4,16 +4,27 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 import json
+import threading
+import time
 import uuid
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
-from .config import DATA_DIR, CORS_ORIGINS, MAX_UPLOAD_BYTES, MAX_SAMPLES
+from .config import (DATA_DIR, CORS_ORIGINS, MAX_UPLOAD_BYTES, MAX_SAMPLES,
+                     INFERENCE_CONCURRENCY, COMPILE_CONCURRENCY, MAX_MODEL_LEN,
+                     OFFLINE_BATCH_SIZE, VLLM_METRICS_ENABLED)
 from .db import connect, initialize, seed_demo, now
-from .schemas import ModelCreate, RunCreate
-from .worker import submit_run
+from .schemas import ModelCreate, RunCreate, ReferenceCheckCreate, BatchRunCreate
+from .worker import submit_run, get_progress, clear_progress, REFERENCE_MODEL_NAME
+from .adapters import OfflineBatchAdapter, fetch_vllm_metrics
+from .sandbox import extract_c
 
 EXCLUDED={'INFRA_ERROR','INFERENCE_ERROR'}
+# Rows that exist before the sample reaches a final state are never counted in
+# RC/RE/TCP denominators (old databases have none of them).
+TRANSIENT={'GENERATED','COMPILING'}
+ACTIVE_RUN_STATUSES=('queued','running','cancel_requested')
+ACTIVE_RUN_MARKS=','.join('?' for _ in ACTIVE_RUN_STATUSES)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,7 +32,7 @@ async def lifespan(app: FastAPI):
     seed_demo()
     yield
 
-app=FastAPI(title='DecompileEval MVP', version='0.1.0', lifespan=lifespan)
+app=FastAPI(title='DecompileEval MVP', version='0.4.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_credentials=False,
                    allow_methods=['*'],allow_headers=['*'])
 
@@ -36,6 +47,63 @@ def required(db, table:str, id:int):
     if row is None:
         raise HTTPException(404,f'{table} #{id} not found')
     return row
+
+
+def offline_files(rows):
+    """Resolve only the offline prediction files this app wrote under DATA_DIR."""
+    paths=[]
+    for row in rows:
+        try:
+            cfg=json.loads(row['config_json'] or '{}')
+        except (TypeError,ValueError):
+            continue
+        raw=cfg.get('offline_file')
+        if not raw:
+            continue
+        try:
+            path=Path(raw).resolve()
+        except (OSError,TypeError,ValueError):
+            continue
+        if DATA_DIR in path.parents:
+            paths.append(path)
+    return paths
+
+
+def remove_files(paths):
+    for path in paths:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+
+
+_METRICS_CACHE: dict[str, tuple[float, dict]] = {}
+_METRICS_LOCK = threading.Lock()
+_METRICS_TTL = 2.0
+
+
+def attach_vllm_metrics(progress: dict, model, cfg: dict) -> dict:
+    """Best-effort vLLM /metrics scrape, cached for two seconds."""
+    if not VLLM_METRICS_ENABLED or model['kind'] != 'openai':
+        return progress
+    url = cfg.get('vllm_metrics_url') or model['base_url']
+    if not url:
+        return progress
+    now_ts = time.monotonic()
+    with _METRICS_LOCK:
+        cached = _METRICS_CACHE.get(url)
+        if cached and now_ts - cached[0] < _METRICS_TTL:
+            if cached[1]:
+                progress['vllm_metrics'] = dict(cached[1])
+            return progress
+    metrics = fetch_vllm_metrics(url)
+    with _METRICS_LOCK:
+        _METRICS_CACHE[url] = (now_ts, metrics or {})
+    if metrics:
+        progress['vllm_metrics'] = metrics
+    return progress
 
 
 def validate_sample(obj:dict, n:int):
@@ -104,7 +172,7 @@ def _read_jsonl(raw:bytes):
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'version':'0.1.0','sandbox':'docker-required'}
+    return {'ok':True,'version':'0.4.0','sandbox':'docker-required','pipeline':'async'}
 
 @app.get('/api/overview')
 def overview():
@@ -161,7 +229,10 @@ def sample_detail(sample_id:int):
 @app.get('/api/models')
 def models():
     with connect() as db:
-        return [dict(m) for m in db.execute('SELECT * FROM models ORDER BY id DESC')]
+        # Reference-source runs use an internal model row; keep it out of the
+        # model picker while runs can still join its name.
+        return [dict(m) for m in db.execute(
+            "SELECT * FROM models WHERE kind!='reference' ORDER BY id DESC")]
 
 @app.post('/api/models',status_code=201)
 def create_model(body:ModelCreate):
@@ -180,6 +251,8 @@ def test_model(model_id:int):
         return {'ok':True,'message':'Fixture model is ready. Outputs are illustrative, not LLM-generated.'}
     if m['kind']=='offline':
         return {'ok':True,'message':'Offline predictions do not require a model endpoint.'}
+    if m['kind']=='reference':
+        return {'ok':True,'message':'Reference-source runs do not call a model endpoint.'}
     from .worker import generate_prediction
     try:
         content=generate_prediction(m,{'assembly':'add:\n  lea eax,[rdi+rsi]\n  ret'},
@@ -205,10 +278,17 @@ def create_run(body:RunCreate):
         selected_model=required(db,'models',body.model_id)
         if selected_model['kind']=='offline':
             raise HTTPException(422,'Offline models must be imported via /api/runs/offline')
+        if selected_model['kind']=='reference':
+            raise HTTPException(422,'Use /api/datasets/{id}/reference-check for reference runs')
         samples=_select_samples(db,body.dataset_id,body.optimizations,body.sample_limit)
         if not samples:
             raise HTTPException(422,'No samples match the selected conditions')
         cfg=body.model_dump()
+        cfg['inference_concurrency']=body.inference_concurrency or INFERENCE_CONCURRENCY
+        cfg['compile_concurrency']=body.compile_concurrency or COMPILE_CONCURRENCY
+        cfg['generation_mode']='online'
+        cfg['batch_size']=0
+        cfg['max_model_len']=MAX_MODEL_LEN
         cur=db.execute('''INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at)
                 VALUES(?,?,?,?,?,?)''',(body.dataset_id,body.model_id,'queued',len(samples),
                                         json.dumps(cfg,ensure_ascii=False),now()))
@@ -246,7 +326,9 @@ async def import_offline_run(dataset_id:int=Form(...),name:str=Form('Offline pre
         mid=db.execute('INSERT INTO models(name,kind,created_at) VALUES(?,?,?)',
                        (name.strip()[:100] or 'Offline predictions','offline',now())).lastrowid
         cfg={'dataset_id':dataset_id,'model_id':mid,'optimizations':['O0','O1','O2','O3','Os','Ofast'],
-             'sample_limit':0,'prompt_template':'offline predictions','temperature':0,'max_tokens':1024}
+             'sample_limit':0,'prompt_template':'offline predictions','temperature':0,'max_tokens':1024,
+             'inference_concurrency':1,'compile_concurrency':COMPILE_CONCURRENCY,
+             'generation_mode':'online','batch_size':0,'max_model_len':MAX_MODEL_LEN}
         rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) VALUES(?,?,?,?,?,?)',
                        (dataset_id,mid,'queued',len(samples),'{}',now())).lastrowid
         file_dir=DATA_DIR/'offline'
@@ -259,8 +341,72 @@ async def import_offline_run(dataset_id:int=Form(...),name:str=Form('Offline pre
     return {'run_id':rid,'status':'queued','total':len(samples)}
 
 
+@app.post('/api/runs/batch',status_code=201)
+def create_batch_run(body:BatchRunCreate):
+    """Optional offline generation through the local vLLM Python API."""
+    model_path=(body.model_path or '').strip()
+    if not model_path:
+        raise HTTPException(422,'model_path is required (or set DEC_EVAL_BATCH_MODEL_PATH)')
+    if not OfflineBatchAdapter.available():
+        raise HTTPException(503,'The vLLM Python package is not installed in the backend '
+                                'environment; use the online adapter or install vllm.')
+    with connect() as db:
+        required(db,'datasets',body.dataset_id)
+        selected_model=required(db,'models',body.model_id)
+        if selected_model['kind'] in ('offline','reference'):
+            raise HTTPException(422,'Offline-batch runs require a normal model entry')
+        samples=_select_samples(db,body.dataset_id,body.optimizations,body.sample_limit)
+        if not samples:
+            raise HTTPException(422,'No samples match the selected conditions')
+        cfg=body.model_dump()
+        cfg['generation_mode']='offline_batch'
+        cfg['model_path']=model_path
+        cfg['batch_size']=body.batch_size or OFFLINE_BATCH_SIZE
+        cfg['inference_concurrency']=cfg['batch_size']
+        cfg['compile_concurrency']=body.compile_concurrency or COMPILE_CONCURRENCY
+        cfg['max_model_len']=MAX_MODEL_LEN
+        rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) '
+                       'VALUES(?,?,?,?,?,?)',(body.dataset_id,body.model_id,'queued',len(samples),
+                                              json.dumps(cfg,ensure_ascii=False),now())).lastrowid
+    submit_run(rid)
+    return {'run_id':rid,'status':'queued','total':len(samples),'generation_mode':'offline_batch'}
+
+
+@app.post('/api/datasets/{dataset_id}/reference-check',status_code=201)
+def reference_check(dataset_id:int,body:ReferenceCheckCreate|None=None):
+    """Evaluate the dataset's own reference sources with the exact same sandbox.
+
+    Results are stored in a normal run (using an internal model row) so they can
+    be inspected, cancelled and exported like any other evaluation.  Reference
+    failures indicate a dataset/environment problem, not a model failure.
+    """
+    body=body or ReferenceCheckCreate()
+    with connect() as db:
+        required(db,'datasets',dataset_id)
+        model=db.execute("SELECT id FROM models WHERE kind='reference' AND name=?",
+                         (REFERENCE_MODEL_NAME,)).fetchone()
+        mid=model['id'] if model else db.execute(
+            "INSERT INTO models(name,kind,system_prompt,created_at) VALUES(?,?,?,?)",
+            (REFERENCE_MODEL_NAME,'reference','',now())).lastrowid
+        samples=_select_samples(db,dataset_id,body.optimizations,body.sample_limit)
+        if not samples:
+            raise HTTPException(422,'No samples match the selected conditions')
+        cfg={'dataset_id':dataset_id,'model_id':mid,'optimizations':body.optimizations,
+             'sample_limit':body.sample_limit,
+             'prompt_template':'reference source (no model call)','temperature':0,'max_tokens':128,
+             'inference_concurrency':1,
+             'compile_concurrency':body.compile_concurrency or COMPILE_CONCURRENCY,
+             'generation_mode':'online','batch_size':0,'max_model_len':MAX_MODEL_LEN,
+             'reference':True}
+        rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) '
+                       'VALUES(?,?,?,?,?,?)',(dataset_id,mid,'queued',len(samples),
+                                              json.dumps(cfg,ensure_ascii=False),now())).lastrowid
+    submit_run(rid)
+    return {'run_id':rid,'status':'queued','total':len(samples),'reference':True}
+
+
 def summarize(rows:list[dict]):
-    eligible=[x for x in rows if x['status'] not in EXCLUDED]
+    eligible=[x for x in rows if x['status'] not in EXCLUDED and x['status'] not in TRANSIENT]
     n=len(eligible)
     cp=sum(x['compile_success']==1 for x in eligible)
     re=sum(x['status']=='TEST_PASS' for x in eligible)
@@ -278,29 +424,51 @@ def summarize(rows:list[dict]):
 @app.get('/api/runs')
 def list_runs():
     with connect() as db:
-        return [dict(x) for x in db.execute('''SELECT r.*,m.name AS model_name,d.name AS dataset_name
+        items=[dict(x) for x in db.execute('''SELECT r.*,m.name AS model_name,d.name AS dataset_name
             FROM runs r JOIN models m ON r.model_id=m.id JOIN datasets d ON r.dataset_id=d.id
             ORDER BY r.id DESC LIMIT 100''')]
+    # Live counters are in-memory and cheap to attach for the few active runs.
+    for item in items:
+        if item['status'] in ACTIVE_RUN_STATUSES:
+            item['progress']=get_progress(item['id'])
+    return items
 
 @app.get('/api/runs/{run_id}')
 def get_run(run_id:int):
     with connect() as db:
         run=dict(required(db,'runs',run_id))
         run['config']=json.loads(run.pop('config_json'))
-        rows=[dict(x) for x in db.execute('''SELECT r.id,r.sample_id,r.status,r.compile_success,r.tests_passed,r.tests_total,
-            r.latency_ms,r.error,s.sample_key,s.problem_id,s.optimization,s.compiler
+        rows=[dict(x) for x in db.execute('''SELECT r.id,r.sample_id,r.status,r.compile_success,
+            r.tests_passed,r.tests_total,r.inference_ms,r.compile_ms,r.test_ms,
+            r.sandbox_ms,r.latency_ms,
+            r.prompt_tokens,r.completion_tokens,r.error,
+            s.sample_key,s.problem_id,s.optimization,s.compiler
             FROM results r JOIN samples s ON r.sample_id=s.id
             WHERE r.run_id=? ORDER BY s.id''',(run_id,))]
         model=required(db,'models',run['model_id'])
         dataset=required(db,'datasets',run['dataset_id'])
     run['model_name']=model['name']
     run['dataset_name']=dataset['name']
+    progress=attach_vllm_metrics(get_progress(run_id),model,run['config'])
     grouped=defaultdict(list)
     for item in rows:
         grouped[item['optimization']].append(item)
-    return {'run':run,'metrics':summarize(rows),
+    return {'run':run,'progress':progress,'metrics':summarize(rows),
             'by_optimization':{opt:summarize(items) for opt,items in sorted(grouped.items())},
             'results':rows}
+
+
+@app.get('/api/runs/{run_id}/progress')
+def run_progress(run_id:int):
+    with connect() as db:
+        run=required(db,'runs',run_id)
+        model=required(db,'models',run['model_id'])
+    try:
+        cfg=json.loads(run['config_json'] or '{}')
+    except ValueError:
+        cfg={}
+    progress=get_progress(run_id)
+    return attach_vllm_metrics(progress,model,cfg)
 
 @app.get('/api/results/{result_id}')
 def result_detail(result_id:int):
@@ -311,6 +479,19 @@ def result_detail(result_id:int):
         if row is None:raise HTTPException(404,'Result not found')
         data=dict(row)
     data['tests']=json.loads(data.pop('tests_json'))
+    data['extracted_source']=extract_c(data.get('model_output') or '')
+    try:
+        detail=json.loads(data.get('detail_json') or '{}')
+    except ValueError:
+        detail={}
+    data['detail']=detail
+    data['tests_detail']=detail.get('tests') or []
+    data['harness_mode']=detail.get('harness_mode') or ('program' if len(data['tests'])==1 and 'program' in data['tests'][0] else 'cases')
+    data['harness_note']=detail.get('harness_note') or ''
+    try:
+        data['generation_params']=json.loads(data.get('generation_params_json') or '{}')
+    except ValueError:
+        data['generation_params']={}
     return data
 
 @app.post('/api/runs/{run_id}/cancel')
@@ -332,10 +513,50 @@ def retry_run(run_id:int):
         if run['status'] not in ('interrupted','completed_with_errors','cancelled'):
             raise HTTPException(409,'Only interrupted, cancelled or infrastructure-failed runs can resume')
         db.execute("DELETE FROM results WHERE run_id=? AND status IN ('INFRA_ERROR','INFERENCE_ERROR')",(run_id,))
-        count=db.execute('SELECT COUNT(*) FROM results WHERE run_id=?',(run_id,)).fetchone()[0]
-        db.execute("UPDATE runs SET status='queued',finished_at=NULL,error='',completed=? WHERE id=?",(count,run_id))
+        count=db.execute("SELECT COUNT(*) FROM results WHERE run_id=? AND status NOT IN ('GENERATED','COMPILING')",
+                         (run_id,)).fetchone()[0]
+        db.execute("UPDATE runs SET status='queued',started_at=NULL,finished_at=NULL,error='',completed=? WHERE id=?",
+                   (count,run_id))
+    clear_progress(run_id)
     submit_run(run_id)
     return {'ok':True,'run_id':run_id}
+
+@app.delete('/api/runs/{run_id}')
+def delete_run(run_id:int):
+    """Delete one finished run together with its results and offline prediction file."""
+    with connect() as db:
+        run=required(db,'runs',run_id)
+        if run['status'] in ACTIVE_RUN_STATUSES:
+            raise HTTPException(409,'Stop the run before deleting it')
+        db.execute('DELETE FROM results WHERE run_id=?',(run_id,))
+        db.execute('DELETE FROM runs WHERE id=?',(run_id,))
+        # Offline imports create one model per run; drop it once no run references it.
+        db.execute("DELETE FROM models WHERE kind='offline' AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.model_id=models.id)")
+        clear_progress(run_id)
+        files=offline_files([run])
+    remove_files(files)
+    return {'ok':True,'deleted':1}
+
+
+@app.delete('/api/runs')
+def delete_finished_runs():
+    """Delete every finished run (completed, failed, cancelled or interrupted)."""
+    with connect() as db:
+        rows=[dict(x) for x in db.execute(
+            f'SELECT id,config_json FROM runs WHERE status NOT IN ({ACTIVE_RUN_MARKS})',ACTIVE_RUN_STATUSES)]
+        if not rows:
+            return {'ok':True,'deleted':0}
+        ids=[x['id'] for x in rows]
+        marks=','.join('?' for _ in ids)
+        db.execute(f'DELETE FROM results WHERE run_id IN ({marks})',ids)
+        db.execute(f'DELETE FROM runs WHERE id IN ({marks})',ids)
+        db.execute("DELETE FROM models WHERE kind='offline' AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.model_id=models.id)")
+        for item in ids:
+            clear_progress(item)
+        files=offline_files(rows)
+    remove_files(files)
+    return {'ok':True,'deleted':len(ids)}
+
 
 @app.get('/api/compare')
 def compare_runs(run_ids:str=Query(...,description='Comma-separated run IDs')):

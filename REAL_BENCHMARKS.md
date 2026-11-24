@@ -1,5 +1,7 @@
 # DecompileEval v0.2 — LLM4Decompile-1.3B-v1.5 实测指导
 
+> **v0.4 说明**：评测协议、Prompt、测试断言与 RC/RE/TCP 口径保持不变。执行层为动态并发流水线（默认 128 在途请求，完成即补位），新增真实 Tokenizer 上下文检查（`INPUT_TOO_LONG`）、可选离线批量 `OfflineBatchAdapter`、Token/s 遥测与 `GET /api/runs/{id}/progress`、参考源码基线 `POST /api/datasets/{id}/reference-check`。下文步骤仍然适用。
+
 **说明**：这是基于 v0.1 的增量版本。支持 vLLM Text Completions 和完整官方测试 harness。HumanEval/MBPP 的数据转换已实现，但仍必须对原始参考代码进行 oracle 测试；ExeBench 官方原始数据只提供下载和检查，**未**宣称与早期论文的 2621 样本一致，也未实现其可执行 wrapper 适配。
 
 ## 0. Python 依赖

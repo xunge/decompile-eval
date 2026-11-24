@@ -59,7 +59,7 @@ def initialize():
           model_id INTEGER NOT NULL REFERENCES models(id),
           status TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
           config_json TEXT NOT NULL, created_at TEXT NOT NULL,
-          finished_at TEXT, error TEXT NOT NULL DEFAULT ''
+          started_at TEXT, finished_at TEXT, error TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS results (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,18 +71,49 @@ def initialize():
           model_output TEXT NOT NULL DEFAULT '',
           compile_log TEXT NOT NULL DEFAULT '', run_log TEXT NOT NULL DEFAULT '',
           latency_ms INTEGER NOT NULL DEFAULT 0, error TEXT NOT NULL DEFAULT '',
+          inference_ms INTEGER NOT NULL DEFAULT 0,
+          compile_ms INTEGER NOT NULL DEFAULT 0,
+          test_ms INTEGER NOT NULL DEFAULT 0,
+          sandbox_ms INTEGER NOT NULL DEFAULT 0,
+          prompt_tokens INTEGER NOT NULL DEFAULT 0,
+          completion_tokens INTEGER NOT NULL DEFAULT 0,
+          prompt_text TEXT NOT NULL DEFAULT '',
+          generation_params_json TEXT NOT NULL DEFAULT '',
+          detail_json TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           UNIQUE(run_id, sample_id)
         );
         CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
         CREATE INDEX IF NOT EXISTS idx_samples_ds ON samples(dataset_id);
+        CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status);
         ''')
         # Preserve pre-existing SQLite installations when adding model API mode.
         model_cols={r[1] for r in db.execute('PRAGMA table_info(models)')}
         if 'api_mode' not in model_cols:
             db.execute("ALTER TABLE models ADD COLUMN api_mode TEXT NOT NULL DEFAULT 'chat'")
+        # Automatic, additive migration for existing evaluation databases.
+        _ensure_column(db, 'runs', 'started_at', 'TEXT')
+        for column, ddl in (
+            ('inference_ms', 'INTEGER NOT NULL DEFAULT 0'),
+            ('compile_ms', 'INTEGER NOT NULL DEFAULT 0'),
+            ('test_ms', 'INTEGER NOT NULL DEFAULT 0'),
+            ('sandbox_ms', 'INTEGER NOT NULL DEFAULT 0'),
+            ('prompt_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+            ('completion_tokens', 'INTEGER NOT NULL DEFAULT 0'),
+            ('prompt_text', "TEXT NOT NULL DEFAULT ''"),
+            ('generation_params_json', "TEXT NOT NULL DEFAULT ''"),
+            ('detail_json', "TEXT NOT NULL DEFAULT ''"),
+        ):
+            _ensure_column(db, 'results', column, ddl)
+        db.execute('CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status)')
         # A run that was interrupted by a server restart must never be shown as actively running.
         db.execute("UPDATE runs SET status='interrupted', error='Server restarted; select Retry to resume.' WHERE status IN ('running','queued')")
+
+
+def _ensure_column(db, table: str, column: str, ddl: str):
+    columns = {row[1] for row in db.execute(f'PRAGMA table_info({table})')}
+    if column not in columns:
+        db.execute(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}')
 
 
 def seed_demo():
