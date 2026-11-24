@@ -32,6 +32,9 @@ def test_dataset_upload_validation():
         did=r.json()['dataset_id']
         items=client.get(f'/api/datasets/{did}/samples').json()
         assert items[0]['sample_key']=='test_1'
+        datasets=client.get('/api/datasets').json()
+        uploaded=next(d for d in datasets if d['id']==did)
+        assert len(uploaded['source_hash'])==64
         bad=client.post('/api/datasets/import',files={'file':('bad.jsonl',b'{not json}','text/plain')},data={'name':'Broken'})
         assert bad.status_code==422
 
@@ -200,8 +203,13 @@ def test_db_migration_is_idempotent():
         run_cols={r[1] for r in conn.execute('PRAGMA table_info(runs)')}
     assert {'inference_ms','compile_ms','test_ms','prompt_tokens',
             'completion_tokens','prompt_text','generation_params_json',
-            'sandbox_ms','detail_json'} <= result_cols
-    assert 'started_at' in run_cols
+            'sandbox_ms','cases_declared','cases_total','cases_passed',
+            'test_case_status','metric_version','detail_json'} <= result_cols
+    assert 'started_at' in run_cols and 'metric_version' in run_cols
+    with db.connect() as conn:
+        tables={r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {'case_manifests','test_case_results'} <= tables
 
 
 def test_reference_model_cannot_be_used_as_normal_run():

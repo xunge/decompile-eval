@@ -104,3 +104,85 @@ def test_real_sandbox_logs_special_characters_and_truncation():
     assert 'quote="x"' in test['stdout']
     assert test['stdout_truncated'] is True
     assert 'truncated' in out.run_log
+
+
+def _diagnostic(harness, language='c'):
+    from app.case_extract import DIAG_HEADER, extract_manifest
+    manifest = extract_manifest(harness, language)
+    assert manifest.status == 'OK', manifest.reason
+    return {'harness': manifest.rewritten_harness, 'header': DIAG_HEADER,
+            'max_cases': 50}
+
+
+def test_real_diagnostic_cases_isolate_failed_assertion():
+    from app.sandbox import evaluate_code
+    harness = ('#include <assert.h>\n'
+               'int f(int x);\n'
+               'int main(){ assert(f(1)==2); assert(f(2)==2); assert(f(3)==4); return 0; }\n')
+    out = evaluate_code('int f(int x){return x;}', '',
+                        [{'name': 'h', 'program': harness}],
+                        diagnostic=_diagnostic(harness), test_timeout=3)
+    assert out.status == 'WRONG_ANSWER', out.status
+    assert out.diagnostic_status == 'OK'
+    assert len(out.cases) == 3
+    assert [c['passed'] for c in out.cases] == [False, True, False]
+    assert out.cases[0]['actual'] == '1' and out.cases[0]['expected'] == '2'
+    assert out.cases[1]['actual'] == '2' and out.cases[1]['expected'] == '2'
+    assert out.cases[2]['after_prior_failure'] is True
+
+
+def test_real_diagnostic_dynamic_loop_and_single_evaluation():
+    from app.sandbox import evaluate_code
+    harness = ('#include <assert.h>\n'
+               'int f(void); int g(int x);\n'
+               'int main(){ for (int i=0;i<3;i++) assert(g(i)==i);'
+               ' assert(f()==1); assert(f()==2); return 0; }\n')
+    out = evaluate_code(
+        'int f(void){static int n=0; return ++n;} int g(int x){return x;}', '',
+        [{'name': 'h', 'program': harness}],
+        diagnostic=_diagnostic(harness), test_timeout=3)
+    assert out.status == 'TEST_PASS'
+    # Three dynamic loop instances (same static assert) plus two static asserts.
+    assert len(out.cases) == 5
+    assert [c['static_id'] for c in out.cases] == [0, 0, 0, 1, 2]
+    assert [c['actual'] for c in out.cases[-2:]] == ['1', '2'], \
+        'function must be evaluated exactly once per case'
+
+
+def test_real_diagnostic_float_string_and_boolean_values():
+    from app.sandbox import evaluate_code
+    harness = ('#include <assert.h>\n#include <string.h>\n#include <math.h>\n'
+               'int fint(int); const char *fstr(void); double fdbl(double); int flag(int);\n'
+               'int main(){'
+               ' assert(fint(-3)==-3);'
+               ' assert(strcmp(fstr(),"abc")==0);'
+               ' assert(fabs(fdbl(1.0)-1.05)<0.1);'
+               ' assert(flag(2)>0 && flag(3)>0);'
+               ' return 0; }\n')
+    candidate = ('int fint(int x){return x;} const char *fstr(void){return "abc";} '
+                 'double fdbl(double x){return x+0.05;} int flag(int x){return x;}')
+    out = evaluate_code(candidate, '', [{'name': 'h', 'program': harness}],
+                        diagnostic=_diagnostic(harness), test_timeout=3)
+    assert out.status == 'TEST_PASS'
+    assert len(out.cases) == 4
+    assert all(c['passed'] for c in out.cases)
+    assert out.cases[0]['actual'] == '-3' and out.cases[0]['expected'] == '-3'
+    assert out.cases[1]['actual'] == '0' and out.cases[1]['expected'] == '0'
+    assert out.cases[2]['actual_ok'] and out.cases[3]['actual'] in ('1', 'true')
+
+
+def test_real_diagnostic_cpp_cases_have_no_fabricated_values():
+    from app.sandbox import evaluate_code
+    harness = ('#include <cassert>\n'
+               'int f(int);\n'
+               'int main(){ assert(f(2)==3); assert(f(2)==2); return 0; }\n')
+    out = evaluate_code('int f(int x){return x;}', '',
+                        [{'name': 'h', 'program': harness}],
+                        language='cpp', diagnostic=_diagnostic(harness, 'cpp'),
+                        test_timeout=3)
+    assert out.status == 'WRONG_ANSWER'
+    assert len(out.cases) == 2
+    assert [c['passed'] for c in out.cases] == [False, True]
+    # C++ diagnostics keep pass/fail but do not invent typed values.
+    assert out.cases[0]['actual_ok'] is False
+    assert out.cases[0]['actual'] == ''

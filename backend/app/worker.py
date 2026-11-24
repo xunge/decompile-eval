@@ -15,9 +15,11 @@ and exposed through :func:`get_progress`; durable per-sample state lives in the
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import random
+import re
 import threading
 import time
 from collections import Counter
@@ -31,9 +33,14 @@ from .config import (
     INFERENCE_RETRIES, INFERENCE_TIMEOUT, LOG_LIMIT_BYTES,
     MAX_COMPILE_CONCURRENCY, MAX_INFERENCE_CONCURRENCY, MAX_MODEL_LEN,
     MAX_PENDING_COMPILE, OFFLINE_BATCH_SIZE, TEST_TIMEOUT,
+    DIAGNOSTICS_ENABLED, MAX_DIAGNOSTIC_CASES,
+    AUTO_INITIAL_INFLIGHT, AUTO_MAX_INFLIGHT, AUTO_STEP,
+    COMPILE_MEMORY_FRACTION, COMPILE_MEMORY_PER_WORKER_MB,
 )
+from .case_extract import DIAG_HEADER, METRIC_VERSION, PARSER_VERSION, extract_manifest
 from .db import connect, now
 from .adapters import (
+    VllmTokenizer,
     BatchUnavailable, Generation, InferenceError, InputTooLong, OfflineBatchAdapter,
     OnlineAdapter, post_with_retries as _post_with_retries,
 )
@@ -227,12 +234,329 @@ def _load_run(run_id: int):
         return dict(run), dict(model), cfg, [dict(s) for s in samples], existing
 
 
+def _cached_manifest(sample: dict, harness: str, language: str) -> dict:
+    digest = hashlib.sha256((language + '\0' + harness).encode('utf-8')).hexdigest()
+    with connect() as db:
+        row = db.execute(
+            'SELECT manifest_json FROM case_manifests WHERE sample_id=? AND harness_hash=? AND parser_version=?',
+            (sample['id'], digest, PARSER_VERSION)).fetchone()
+        if row is not None:
+            try:
+                return json.loads(row['manifest_json'])
+            except ValueError:
+                pass
+    manifest = extract_manifest(harness, language)
+    data = manifest.as_dict()
+    with _WRITE_LOCK:
+        with connect() as db:
+            db.execute('''INSERT OR REPLACE INTO case_manifests
+                (sample_id,harness_hash,parser_version,status,manifest_json,created_at)
+                VALUES(?,?,?,?,?,?)''',
+                (sample['id'], digest, PARSER_VERSION, data['status'],
+                 json.dumps(data, ensure_ascii=False), now()))
+    return data
+
+
+def _build_diagnostics(samples: list[dict]) -> dict[int, dict]:
+    """Load/cache a per-sample test-case manifest (tree-sitter extraction)."""
+    result: dict[int, dict] = {}
+    for sample in samples:
+        try:
+            tests = json.loads(sample['tests_json'])
+        except (TypeError, ValueError):
+            result[sample['id']] = {'status': 'INVALID_HARNESS', 'diagnostic': None, 'manifest': {}}
+            continue
+        if not DIAGNOSTICS_ENABLED:
+            result[sample['id']] = {'status': 'DISABLED', 'diagnostic': None, 'manifest': {}}
+            continue
+        if not (len(tests) == 1 and 'program' in tests[0]):
+            result[sample['id']] = {
+                'status': 'DISCRETE', 'diagnostic': None,
+                'manifest': {'mode': 'discrete', 'static_case_count': len(tests)},
+            }
+            continue
+        language = 'cpp' if sample['language'] == 'cpp' else 'c'
+        try:
+            data = _cached_manifest(sample, tests[0]['program'], language)
+        except Exception as exc:  # never break a run because diagnostics failed
+            data = {'status': 'EXTRACTION_ERROR',
+                    'reason': f'{type(exc).__name__}: {str(exc)[:300]}',
+                    'cases': [], 'rewritten_harness': ''}
+        diagnostic = None
+        if data.get('status') == 'OK' and data.get('rewritten_harness'):
+            diagnostic = {
+                'harness': data['rewritten_harness'],
+                'header': DIAG_HEADER,
+                'max_cases': MAX_DIAGNOSTIC_CASES,
+            }
+        result[sample['id']] = {
+            'status': data.get('status', 'UNSUPPORTED_CASE_EXTRACTION'),
+            'diagnostic': diagnostic,
+            'manifest': data,
+            'language': language,
+        }
+    return result
+
+
+def _value_json(text, supported: bool) -> str:
+    if not supported:
+        return ''
+    value = '' if text is None else str(text)
+    if value == '':
+        return ''
+    if re.fullmatch(r'-?\d+', value):
+        return json.dumps(int(value))
+    try:
+        return json.dumps(float(value))
+    except ValueError:
+        return json.dumps(value)
+
+
+def _case_error_type(event: dict) -> str:
+    if event.get('passed'):
+        return 'NONE'
+    if event.get('timed_out'):
+        return 'TIMEOUT'
+    if event.get('signal') is not None:
+        return 'RUNTIME'
+    return 'ASSERTION'
+
+
+def _case_source_span(manifest_case: dict) -> str:
+    if not manifest_case:
+        return ''
+    return json.dumps({
+        'start_line': manifest_case.get('line'),
+        'start_column': manifest_case.get('column'),
+        'end_line': manifest_case.get('end_line'),
+        'end_column': manifest_case.get('end_column'),
+        'span': manifest_case.get('span'),
+    }, ensure_ascii=False)
+
+
+def _case_row(**overrides) -> dict:
+    row = {
+        'case_id': '', 'case_index': 0, 'static_id': -1,
+        'case_source_span': '', 'input_text': '', 'input_values_json': '',
+        'expected_text': '', 'expected_value_json': '',
+        'actual_text': '', 'actual_value_json': '',
+        'compare_expression': '', 'comparison_rule': '',
+        'passed': 0, 'status': 'NOT_EXECUTED',
+        'exit_code': None, 'signal': None,
+        'stdout': '', 'stderr': '',
+        'stdout_truncated': 0, 'stderr_truncated': 0,
+        'duration_ms': 0, 'oracle_source': '', 'diagnostic_status': '',
+        'error_type': '',
+    }
+    row.update(overrides)
+    return row
+
+
+def _discrete_cases(outcome, tests: list[dict], compile_failed: bool):
+    rows = []
+    events = {int(ev.get('index', 0)): ev for ev in outcome.tests}
+    for index, test in enumerate(tests):
+        code = test.get('code') or test.get('program') or ''
+        event = events.get(index)
+        base = dict(case_id=f't{index}', case_index=index, static_id=index,
+                    input_text=code[:150000],
+                    compare_expression='', comparison_rule='discrete_test',
+                    oracle_source='discrete_harness', diagnostic_status='DISCRETE')
+        if compile_failed:
+            rows.append(_case_row(**{**base, 'status': 'NOT_RUN_COMPILE_ERROR',
+                                     'error_type': 'COMPILE_ERROR'}))
+            continue
+        if event is None:
+            rows.append(_case_row(**{**base, 'status': 'NOT_EXECUTED',
+                                     'diagnostic_status': 'DISCRETE;NOT_EXECUTED'}))
+            continue
+        passed = event.get('status') == 'PASS'
+        rows.append(_case_row(
+            **base,
+            passed=int(passed),
+            status='PASS' if passed else 'FAIL',
+            exit_code=event.get('exit_code'),
+            signal=event.get('signal'),
+            stdout=str(event.get('stdout') or '')[:150000],
+            stderr=str(event.get('stderr') or '')[:150000],
+            stdout_truncated=int(bool(event.get('stdout_truncated'))),
+            stderr_truncated=int(bool(event.get('stderr_truncated'))),
+            duration_ms=int(event.get('duration_ms') or 0),
+            error_type=_case_error_type(event),
+        ))
+    executed = [row for row in rows if row['status'] in ('PASS', 'FAIL')]
+    status = 'NOT_RUN_COMPILE_ERROR' if compile_failed else 'OK'
+    return rows, len(tests), len(executed), sum(r['passed'] for r in executed), status
+
+
+def _program_cases(outcome, info: dict, compile_failed: bool):
+    manifest = info.get('manifest') or {}
+    manifest_cases = {int(c['static_id']): c for c in manifest.get('cases', [])
+                      if isinstance(c, dict) and 'static_id' in c}
+    declared = len(manifest_cases)
+    if compile_failed:
+        rows = []
+        for sid, case in sorted(manifest_cases.items()):
+            rows.append(_case_row(
+                case_id=f'a{sid}', case_index=sid + 1, static_id=sid,
+                case_source_span=_case_source_span(case),
+                input_text=(case.get('lhs') or case.get('expression') or '')[:150000],
+                expected_text=(case.get('rhs') or '1')[:150000],
+                compare_expression=(case.get('expression') or '')[:150000],
+                comparison_rule=case.get('comparison_rule') or '',
+                status='NOT_RUN_COMPILE_ERROR', oracle_source='assertion',
+                diagnostic_status='NOT_RUN_COMPILE_ERROR', error_type='COMPILE_ERROR'))
+        return rows, declared, 0, 0, 'NOT_RUN_COMPILE_ERROR'
+
+    if info.get('status') != 'OK':
+        rows = []
+        for sid, case in sorted(manifest_cases.items()):
+            rows.append(_case_row(
+                case_id=f'a{sid}', case_index=sid + 1, static_id=sid,
+                case_source_span=_case_source_span(case),
+                input_text=(case.get('lhs') or case.get('expression') or '')[:150000],
+                expected_text=(case.get('rhs') or '1')[:150000],
+                compare_expression=(case.get('expression') or '')[:150000],
+                comparison_rule=case.get('comparison_rule') or '',
+                status='NOT_RUN_DIAG_ERROR', oracle_source='assertion',
+                diagnostic_status=info.get('status') or 'UNSUPPORTED_CASE_EXTRACTION',
+                error_type=info.get('status') or 'UNSUPPORTED_CASE_EXTRACTION'))
+        return rows, declared, 0, 0, info.get('status') or 'UNSUPPORTED_CASE_EXTRACTION'
+
+    events = list(outcome.cases)
+    seen_static: dict[int, int] = {}
+    for event in events:
+        sid = int(event.get('static_id', -1))
+        seen_static[sid] = seen_static.get(sid, 0) + 1
+    instances: dict[int, int] = {}
+    rows = []
+    executed_static: set[int] = set()
+    for event in events:
+        sid = int(event.get('static_id', -1))
+        manifest_case = manifest_cases.get(sid, {})
+        instance = instances.get(sid, 0)
+        instances[sid] = instance + 1
+        executed_static.add(sid)
+        case_id = f'a{sid}' + (f'#{instance}' if seen_static.get(sid, 0) > 1 else '')
+        passed = bool(event.get('passed'))
+        diagnostic_status = 'OK'
+        if event.get('after_prior_failure'):
+            diagnostic_status = 'AFTER_PRIOR_FAILURE'
+        if not event.get('actual_ok') or not event.get('expected_ok'):
+            diagnostic_status += ';VALUE_UNSUPPORTED'
+        op = manifest_case.get('comparison_operator') or ''
+        rows.append(_case_row(
+            case_id=case_id,
+            case_index=int(event.get('index') or 0),
+            static_id=sid,
+            case_source_span=_case_source_span(manifest_case),
+            input_text=(manifest_case.get('lhs') or event.get('lhs')
+                        or event.get('expression') or '')[:150000],
+            expected_text=(manifest_case.get('rhs') or event.get('expected') or '')[:150000],
+            expected_value_json=_value_json(event.get('expected'), bool(event.get('expected_ok'))),
+            actual_text=(event.get('actual') or '')[:150000],
+            actual_value_json=_value_json(event.get('actual'), bool(event.get('actual_ok'))),
+            compare_expression=(event.get('expression') or '')[:150000],
+            comparison_rule=(op or manifest_case.get('comparison_rule') or 'expression'),
+            passed=int(passed),
+            status='PASS' if passed else 'FAIL',
+            exit_code=event.get('exit_code'),
+            signal=event.get('signal'),
+            stdout=str(event.get('stdout') or '')[:150000],
+            stderr=str(event.get('stderr') or '')[:150000],
+            stdout_truncated=int(bool(event.get('stdout_truncated'))),
+            stderr_truncated=int(bool(event.get('stderr_truncated'))),
+            duration_ms=int(event.get('duration_ms') or 0),
+            oracle_source='assertion',
+            diagnostic_status=diagnostic_status,
+            error_type=_case_error_type(event),
+        ))
+    # Static, non-dynamic cases that never executed are reported explicitly.
+    for sid, case in sorted(manifest_cases.items()):
+        if sid in executed_static or case.get('dynamic'):
+            continue
+        rows.append(_case_row(
+            case_id=f'a{sid}', case_index=sid + 1, static_id=sid,
+            case_source_span=_case_source_span(case),
+            input_text=(case.get('lhs') or case.get('expression') or '')[:150000],
+            expected_text=(case.get('rhs') or '1')[:150000],
+            compare_expression=(case.get('expression') or '')[:150000],
+            comparison_rule=case.get('comparison_rule') or '',
+            status='NOT_EXECUTED', oracle_source='assertion',
+            diagnostic_status='NOT_EXECUTED', error_type='NOT_EXECUTED'))
+    executed = [row for row in rows if row['status'] in ('PASS', 'FAIL')]
+    status = outcome.diagnostic_status or ('OK' if executed else 'NO_CASES_EXECUTED')
+    return rows, declared, len(executed), sum(r['passed'] for r in executed), status
+
+
+def _build_case_rows(outcome, sample: dict, info: dict):
+    try:
+        tests = json.loads(sample['tests_json'])
+    except (TypeError, ValueError):
+        return [], 0, 0, 0, 'INVALID_HARNESS'
+    compile_failed = outcome.status in ('COMPILE_ERROR', 'COMPILE_TIMEOUT')
+    if info.get('status') == 'DISCRETE':
+        return _discrete_cases(outcome, tests, compile_failed)
+    return _program_cases(outcome, info, compile_failed)
+
+
+def _replace_cases(db, run_id: int, sample_id: int, rows: list[dict]) -> None:
+    db.execute('DELETE FROM test_case_results WHERE run_id=? AND sample_id=?',
+               (run_id, sample_id))
+    for row in rows:
+        db.execute('''INSERT OR REPLACE INTO test_case_results
+            (run_id,sample_id,case_id,case_index,static_id,case_source_span,
+             input_text,input_values_json,expected_text,expected_value_json,
+             actual_text,actual_value_json,compare_expression,comparison_rule,
+             passed,status,exit_code,signal,stdout,stderr,stdout_truncated,
+             stderr_truncated,duration_ms,oracle_source,diagnostic_status,
+             error_type,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (run_id, sample_id, row['case_id'], row['case_index'], row['static_id'],
+             row['case_source_span'], row['input_text'], row['input_values_json'],
+             row['expected_text'], row['expected_value_json'], row['actual_text'],
+             row['actual_value_json'], row['compare_expression'], row['comparison_rule'],
+             int(row['passed']), row['status'], row['exit_code'], row['signal'],
+             row['stdout'], row['stderr'], int(row['stdout_truncated']),
+             int(row['stderr_truncated']), row['duration_ms'], row['oracle_source'],
+             row['diagnostic_status'], row['error_type'], now()))
+
+
+def _memory_available_mb() -> int | None:
+    try:
+        with open('/proc/meminfo', encoding='ascii') as fp:
+            for line in fp:
+                if line.startswith('MemAvailable:'):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _compile_limit(requested: int) -> int:
+    """Cap Docker workers by available RAM and CPU, never above the request."""
+    requested = max(1, min(int(requested), MAX_COMPILE_CONCURRENCY))
+    available = _memory_available_mb()
+    cpu = os.cpu_count() or 1
+    if available is not None:
+        memory_cap = max(1, int(available * COMPILE_MEMORY_FRACTION
+                                 // COMPILE_MEMORY_PER_WORKER_MB))
+        requested = min(requested, memory_cap)
+    return max(1, min(requested, max(1, cpu)))
+
+
 def _resolve_concurrency(cfg: dict) -> tuple[int, int]:
-    inference = cfg.get('inference_concurrency') or INFERENCE_CONCURRENCY
-    compile_workers = cfg.get('compile_concurrency') or COMPILE_CONCURRENCY
-    inference = max(1, min(int(inference), MAX_INFERENCE_CONCURRENCY))
-    compile_workers = max(1, min(int(compile_workers), MAX_COMPILE_CONCURRENCY))
+    raw_inference = cfg.get('inference_concurrency')
+    inference = INFERENCE_CONCURRENCY if raw_inference is None else raw_inference
+    inference = max(0, min(int(inference), MAX_INFERENCE_CONCURRENCY))
+    compile_requested = int(cfg.get('compile_concurrency') or COMPILE_CONCURRENCY)
+    compile_workers = _compile_limit(compile_requested)
     return inference, compile_workers
+
+
+def _compile_requested(cfg: dict) -> int:
+    return max(1, min(int(cfg.get('compile_concurrency') or COMPILE_CONCURRENCY),
+                      MAX_COMPILE_CONCURRENCY))
 
 
 def _mark_running(run_id: int) -> bool:
@@ -250,12 +574,13 @@ def _read_run_status(run_id: int) -> str | None:
         return row['status'] if row is not None else None
 
 
-def _insert_generated(db, run_id: int, sample: dict, gen: Generation) -> None:
+def _insert_generated(db, run_id: int, sample: dict, gen: Generation,
+                      submitted_at: str = '', generated_at: str = '') -> None:
     db.execute('''
             INSERT INTO results(run_id,sample_id,status,compile_success,tests_passed,tests_total,
                                 model_output,inference_ms,latency_ms,prompt_tokens,completion_tokens,
-                                prompt_text,generation_params_json,created_at)
-            VALUES(?,?,'GENERATED',NULL,0,?,?,?,?,?,?,?,?,?)
+                                prompt_text,generation_params_json,submitted_at,generated_at,created_at)
+            VALUES(?,?,'GENERATED',NULL,0,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(run_id,sample_id) DO UPDATE SET
                 status='GENERATED', compile_success=NULL, tests_passed=0,
                 tests_total=excluded.tests_total, model_output=excluded.model_output,
@@ -263,13 +588,15 @@ def _insert_generated(db, run_id: int, sample: dict, gen: Generation) -> None:
                 prompt_tokens=excluded.prompt_tokens, completion_tokens=excluded.completion_tokens,
                 prompt_text=excluded.prompt_text,
                 generation_params_json=excluded.generation_params_json,
+                submitted_at=excluded.submitted_at, generated_at=excluded.generated_at,
+                first_token_at='', compile_started_at='', compile_finished_at='',
                 compile_log='', run_log='', compile_ms=0, test_ms=0,
                 error='', detail_json='', created_at=excluded.created_at
             WHERE results.status IN ('GENERATED','INFERENCE_ERROR','INFRA_ERROR')
         ''', (run_id, sample['id'], len(json.loads(sample['tests_json'])),
               gen.text[:150000], gen.inference_ms, gen.inference_ms,
               gen.prompt_tokens, gen.completion_tokens, gen.prompt[:150000],
-              json.dumps(gen.params, ensure_ascii=False), now()))
+              json.dumps(gen.params, ensure_ascii=False), submitted_at, generated_at, now()))
 
 
 def _insert_input_too_long(db, run_id: int, sample: dict, exc: InputTooLong,
@@ -302,13 +629,16 @@ def _insert_input_too_long(db, run_id: int, sample: dict, exc: InputTooLong,
 
 
 async def _persist_generation(run_id: int, sample: dict, gen: Generation,
-                              compile_queue: asyncio.Queue) -> None:
-    await _db_write_async(lambda db: _insert_generated(db, run_id, sample, gen))
+                              compile_queue: asyncio.Queue,
+                              submitted_at: str = '', generated_at: str = '') -> None:
+    await _db_write_async(lambda db: _insert_generated(
+        db, run_id, sample, gen, submitted_at, generated_at or now()))
     _progress_patch(run_id, inference_done=1, waiting_compile=1,
                     prompt_tokens=gen.prompt_tokens,
                     completion_tokens=gen.completion_tokens,
                     inference_ms_sum=gen.inference_ms)
-    await compile_queue.put((sample, gen.text, gen.inference_ms))
+    await compile_queue.put((sample, gen.text, gen.inference_ms,
+                             submitted_at, generated_at or now()))
 
 
 async def _persist_inference_error(run_id: int, sample: dict,
@@ -351,19 +681,28 @@ def _insert_inference_error(db, run_id: int, sample: dict, error: str, inference
 
 
 def _update_compiled(db, run_id: int, sample: dict, outcome: EvalOutcome,
-                     inference_ms: int, sandbox_ms: int) -> bool:
+                     inference_ms: int, sandbox_ms: int, case_rows: list[dict],
+                     cases_declared: int, cases_total: int, cases_passed: int,
+                     test_case_status: str,
+                     compile_started_at: str = '', compile_finished_at: str = '') -> bool:
     latency = inference_ms + sandbox_ms
     cur = db.execute('''
             UPDATE results SET status=?, compile_success=?, tests_passed=?, tests_total=?,
                 compile_log=?, run_log=?, error=?, compile_ms=?, test_ms=?, sandbox_ms=?,
-                latency_ms=?, detail_json=?, created_at=?
+                latency_ms=?, cases_declared=?, cases_total=?, cases_passed=?,
+                test_case_status=?, metric_version=?, compile_started_at=?,
+                compile_finished_at=?, detail_json=?, created_at=?
             WHERE run_id=? AND sample_id=? AND status='GENERATED'
         ''', (outcome.status,
               None if outcome.compile_success is None else int(outcome.compile_success),
               outcome.tests_passed, outcome.tests_total,
               outcome.compile_log, outcome.run_log, outcome.error,
               outcome.compile_ms, outcome.test_ms, sandbox_ms, latency,
+              cases_declared, cases_total, cases_passed, test_case_status,
+              METRIC_VERSION, compile_started_at, compile_finished_at,
               outcome.detail(), now(), run_id, sample['id']))
+    if cur.rowcount:
+        _replace_cases(db, run_id, sample['id'], case_rows)
     return bool(cur.rowcount)
 
 
@@ -386,8 +725,9 @@ def _finalize(run_id: int, status: str) -> None:
             error = f'{pending} sample(s) have no final result; select Retry to resume.'
         elif status == 'completed' and excluded:
             final = 'completed_with_errors'
-        db.execute('UPDATE runs SET status=?, completed=?, finished_at=?, error=? WHERE id=?',
-                   (final, completed, now(), error, run_id))
+        db.execute('UPDATE runs SET status=?, completed=?, finished_at=?, error=?, '
+                   'metric_version=? WHERE id=?',
+                   (final, completed, now(), error, METRIC_VERSION, run_id))
         return final
     return _db_write(write)
 
@@ -402,14 +742,18 @@ def _store_progress_final(run_id: int, status: str) -> None:
 # ---------------------------------------------------------------------------
 # Compile worker.
 # ---------------------------------------------------------------------------
-async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms: int) -> None:
+async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms: int,
+                       diagnostics: dict | None = None,
+                       submitted_at: str = '', generated_at: str = '') -> None:
     tests = json.loads(sample['tests_json'])
+    info = (diagnostics or {}).get(sample['id']) or {'status': 'DISABLED', 'manifest': {}}
+    compile_started_at = now()
     started = time.perf_counter()
     try:
         outcome = await evaluate_code_async(
             prediction, sample['dependencies'], tests, language=sample['language'],
             compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
-            log_limit=LOG_LIMIT_BYTES)
+            log_limit=LOG_LIMIT_BYTES, diagnostic=info.get('diagnostic'))
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # never let one sample kill the pipeline
@@ -418,11 +762,21 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
     if outcome.status == 'INFRA_ERROR' and outcome.error:
         outcome.error = outcome.error[:1000]
     sandbox_ms = round((time.perf_counter() - started) * 1000)
+    case_rows, cases_declared, cases_total, cases_passed, case_status = \
+        _build_case_rows(outcome, sample, info)
+    compile_finished_at = now()
     await _db_write_async(lambda db: _update_compiled(
-        db, run_id, sample, outcome, inference_ms, sandbox_ms))
+        db, run_id, sample, outcome, inference_ms, sandbox_ms, case_rows,
+        cases_declared, cases_total, cases_passed, case_status,
+        compile_started_at, compile_finished_at))
     deltas = dict(compiling=-1, evaluated=1,
                   compile_ms_sum=outcome.compile_ms, test_ms_sum=outcome.test_ms,
-                  sandbox_ms_sum=sandbox_ms)
+                  sandbox_ms_sum=sandbox_ms, cases_declared=cases_declared,
+                  cases_total=cases_total, cases_passed=cases_passed)
+    if cases_total:
+        deltas['diagnosed_samples'] = 1
+    elif cases_declared:
+        deltas['undiagnosed_samples'] = 1
     if outcome.status != 'TEST_PASS':
         deltas['failed'] = 1
     if outcome.status == 'INFRA_ERROR':
@@ -436,7 +790,8 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
 
 
 async def _compile_worker(run_id: int, queue: asyncio.Queue,
-                          cancel_event: asyncio.Event) -> None:
+                          cancel_event: asyncio.Event,
+                          diagnostics: dict | None = None) -> None:
     while True:
         item = await queue.get()
         try:
@@ -444,9 +799,10 @@ async def _compile_worker(run_id: int, queue: asyncio.Queue,
                 return
             if cancel_event.is_set():
                 return
-            sample, prediction, inference_ms = item
+            sample, prediction, inference_ms, submitted_at, generated_at = item
             _progress_patch(run_id, waiting_compile=-1, compiling=1)
-            await _compile_one(run_id, sample, prediction, inference_ms)
+            await _compile_one(run_id, sample, prediction, inference_ms, diagnostics,
+                               submitted_at, generated_at)
         finally:
             queue.task_done()
 
@@ -455,12 +811,14 @@ async def _compile_worker(run_id: int, queue: asyncio.Queue,
 # Run main loop.
 # ---------------------------------------------------------------------------
 async def _infer_one(run_id: int, model: dict, sample: dict, cfg: dict,
-                     client: httpx.AsyncClient | None, sem: asyncio.Semaphore,
+                     client: httpx.AsyncClient | None,
+                     sem: asyncio.Semaphore | None,
                      compile_queue: asyncio.Queue, cancel_event: asyncio.Event) -> None:
     _progress_patch(run_id, inferring=1)
     try:
         if cancel_event.is_set():
             return
+        submitted_at = now()
         started = time.perf_counter()
         try:
             gen = await generate_prediction_async(model, sample, cfg, client)
@@ -474,10 +832,12 @@ async def _infer_one(run_id: int, model: dict, sample: dict, cfg: dict,
             await _persist_inference_error(
                 run_id, sample, exc, round((time.perf_counter() - started) * 1000))
             return
-        await _persist_generation(run_id, sample, gen, compile_queue)
+        await _persist_generation(run_id, sample, gen, compile_queue,
+                                  submitted_at, now())
     finally:
         _progress_patch(run_id, inferring=-1)
-        sem.release()
+        if sem is not None:
+            sem.release()
 
 
 async def _watch_cancel(run_id: int, cancel_event: asyncio.Event,
@@ -522,7 +882,47 @@ async def _batch_producer(run_id: int, cfg: dict, samples: list[dict],
             elif isinstance(item, BaseException):
                 await _persist_inference_error(run_id, sample, item, elapsed)
             else:
-                await _persist_generation(run_id, sample, item, compile_queue)
+                await _persist_generation(run_id, sample, item, compile_queue,
+                                          now(), now())
+
+
+async def _auto_inference_producer(run_id: int, model: dict, samples: list[dict],
+                                   cfg: dict, client: httpx.AsyncClient | None,
+                                   compile_queue: asyncio.Queue,
+                                   cancel_event: asyncio.Event,
+                                   active: set[asyncio.Task],
+                                   all_tasks: list[asyncio.Task]) -> None:
+    """Continuous supply without a batch barrier (INFERENCE_CONCURRENCY=0).
+
+    The ceiling starts small and grows while work is completing, but is always
+    bounded by AUTO_MAX_INFLIGHT and by the bounded compile queue.  A finished
+    request frees a slot immediately; there is no ``gather`` over a whole batch.
+    """
+    pending = list(samples)
+    position = 0
+    limit = max(1, min(AUTO_INITIAL_INFLIGHT, AUTO_MAX_INFLIGHT))
+    _progress_set(run_id, auto_limit=limit, auto_max_inflight=AUTO_MAX_INFLIGHT)
+    while (position < len(pending) or active) and not cancel_event.is_set():
+        while (position < len(pending) and len(active) < limit
+               and not cancel_event.is_set()):
+            sample = pending[position]
+            position += 1
+            task = asyncio.create_task(_infer_one(
+                run_id, model, sample, cfg, client, None, compile_queue, cancel_event))
+            all_tasks.append(task)
+            active.add(task)
+            task.add_done_callback(active.discard)
+        if not active:
+            break
+        done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+        active.difference_update(done)
+        # Only raise the ceiling while there is still queued work; otherwise the
+        # reported AUTO limit would keep growing after the dataset is drained.
+        if position < len(pending) and limit < AUTO_MAX_INFLIGHT:
+            limit = min(AUTO_MAX_INFLIGHT, limit + AUTO_STEP)
+            _progress_set(run_id, auto_limit=limit)
+    if active:
+        await asyncio.gather(*list(active), return_exceptions=True)
 
 
 async def _evaluate_run(run_id: int) -> None:
@@ -535,7 +935,10 @@ async def _evaluate_run(run_id: int) -> None:
     if not await asyncio.to_thread(_mark_running, run_id):
         return
 
+    diagnostics = await asyncio.to_thread(_build_diagnostics, samples)
     inference_conc, compile_conc = _resolve_concurrency(cfg)
+    compile_requested = _compile_requested(cfg)
+    auto_mode = inference_conc == 0
     batch_mode = cfg.get('generation_mode') == 'offline_batch'
     batch_size = max(1, int(cfg.get('batch_size') or OFFLINE_BATCH_SIZE))
     max_pending = int(cfg.get('max_pending_compile') or MAX_PENDING_COMPILE)
@@ -549,7 +952,8 @@ async def _evaluate_run(run_id: int) -> None:
         if row is None:
             to_infer.append(sample)
         elif row['status'] in ('GENERATED', 'COMPILING'):
-            to_compile.append((sample, row['model_output'], int(row['inference_ms'] or 0)))
+            to_compile.append((sample, row['model_output'], int(row['inference_ms'] or 0),
+                               row.get('submitted_at') or '', row.get('generated_at') or ''))
         # INFERENCE_ERROR and terminal evaluation rows are kept: the retry
         # endpoint is responsible for explicitly requesting them again.
 
@@ -563,6 +967,15 @@ async def _evaluate_run(run_id: int) -> None:
     inference_done = len(existing) - inference_failed - input_too_long
     prompt_tokens = sum(int(r.get('prompt_tokens') or 0) for r in existing.values())
     completion_tokens = sum(int(r.get('completion_tokens') or 0) for r in existing.values())
+    cases_declared = sum(int(r.get('cases_declared') or 0) for r in existing.values())
+    cases_total = sum(int(r.get('cases_total') or 0) for r in existing.values())
+    cases_passed = sum(int(r.get('cases_passed') or 0) for r in existing.values())
+    diagnosed_samples = sum(1 for r in existing.values()
+                            if int(r.get('cases_total') or 0) > 0
+                            and (r.get('test_case_status') or '') in ('OK', 'DISCRETE', 'PARTIAL'))
+    undiagnosed_samples = sum(1 for r in existing.values()
+                              if int(r.get('cases_total') or 0) == 0
+                              and (r.get('test_case_status') or '') not in ('', 'NOT_RUN_COMPILE_ERROR'))
     inference_ms_sum = sum(int(r.get('inference_ms') or 0) for r in existing.values())
     compile_ms_sum = sum(int(r.get('compile_ms') or 0) for r in existing.values())
     test_ms_sum = sum(int(r.get('test_ms') or 0) for r in existing.values())
@@ -590,7 +1003,10 @@ async def _evaluate_run(run_id: int) -> None:
         'infra_errors': infra,
         'excluded': inference_failed + infra,
         'inference_concurrency': inference_conc,
+        'auto_limit': 0,
+        'auto_max_inflight': AUTO_MAX_INFLIGHT if auto_mode else 0,
         'compile_concurrency': compile_conc,
+        'compile_concurrency_requested': compile_requested,
         'max_pending_compile': max_pending,
         'generation_mode': 'offline_batch' if batch_mode else 'online',
         'batch_size': batch_size if batch_mode else 0,
@@ -601,10 +1017,15 @@ async def _evaluate_run(run_id: int) -> None:
         'compile_ms_sum': compile_ms_sum,
         'test_ms_sum': test_ms_sum,
         'sandbox_ms_sum': sandbox_ms_sum,
+        'cases_declared': cases_declared,
+        'cases_total': cases_total,
+        'cases_passed': cases_passed,
+        'diagnosed_samples': diagnosed_samples,
+        'undiagnosed_samples': undiagnosed_samples,
         'status_counts': status_counts,
     })
 
-    sem = asyncio.Semaphore(inference_conc)
+    sem = None if auto_mode else asyncio.Semaphore(inference_conc)
     active_inference: set[asyncio.Task] = set()
     all_inference: list[asyncio.Task] = []
     compile_tasks: list[asyncio.Task] = []
@@ -629,15 +1050,24 @@ async def _evaluate_run(run_id: int) -> None:
 
     for _ in range(compile_conc):
         compile_tasks.append(asyncio.create_task(
-            _compile_worker(run_id, compile_queue, cancel_event)))
+            _compile_worker(run_id, compile_queue, cancel_event, diagnostics)))
     watchdog = asyncio.create_task(_watch_cancel(run_id, cancel_event, active_inference))
     client: httpx.AsyncClient | None = None
+    tokenizer_client: httpx.AsyncClient | None = None
     if not batch_mode and model['kind'] == 'openai':
-        client = httpx.AsyncClient(follow_redirects=False, timeout=None)
+        pool = (AUTO_MAX_INFLIGHT if auto_mode else inference_conc) + 32
+        limits = httpx.Limits(max_connections=pool, max_keepalive_connections=pool)
+        client = httpx.AsyncClient(follow_redirects=False, timeout=None, limits=limits)
+        tokenizer_client = httpx.AsyncClient(
+            follow_redirects=False, timeout=None,
+            limits=httpx.Limits(max_connections=64, max_keepalive_connections=64))
     if batch_mode:
         cfg['_batch_adapter'] = OfflineBatchAdapter(cfg)
     else:
-        cfg['_online_adapter'] = OnlineAdapter(model, cfg, client)
+        tokenizer = None
+        if model['kind'] == 'openai' and tokenizer_client is not None:
+            tokenizer = VllmTokenizer(tokenizer_client, model['base_url'], model['api_model'])
+        cfg['_online_adapter'] = OnlineAdapter(model, cfg, client, tokenizer=tokenizer)
     try:
         for item in to_compile:
             if cancel_event.is_set():
@@ -646,6 +1076,11 @@ async def _evaluate_run(run_id: int) -> None:
             await compile_queue.put(item)
         if batch_mode:
             await _batch_producer(run_id, cfg, to_infer, compile_queue, cancel_event)
+            await asyncio.gather(*all_inference, return_exceptions=True)
+        elif auto_mode:
+            await _auto_inference_producer(run_id, model, to_infer, cfg, client,
+                                           compile_queue, cancel_event,
+                                           active_inference, all_inference)
             await asyncio.gather(*all_inference, return_exceptions=True)
         else:
             await inference_producer()
@@ -668,6 +1103,8 @@ async def _evaluate_run(run_id: int) -> None:
     finally:
         if client is not None:
             await client.aclose()
+        if tokenizer_client is not None:
+            await tokenizer_client.aclose()
         watchdog.cancel()
         try:
             await watchdog
@@ -757,7 +1194,8 @@ def _progress_from_db(run_id: int) -> dict[str, Any]:
         if run is None:
             return {}
         rows = [dict(r) for r in db.execute(
-            'SELECT status,prompt_tokens,completion_tokens,inference_ms,compile_ms,test_ms,sandbox_ms '
+            'SELECT status,prompt_tokens,completion_tokens,inference_ms,compile_ms,test_ms,sandbox_ms,'
+            'cases_declared,cases_total,cases_passed,test_case_status '
             'FROM results WHERE run_id=?', (run_id,))]
     counts = Counter(r['status'] for r in rows)
     evaluated = sum(counts[s] for s in TERMINAL_EVAL)
@@ -771,6 +1209,13 @@ def _progress_from_db(run_id: int) -> dict[str, Any]:
     compile_ms_sum = sum(int(r.get('compile_ms') or 0) for r in rows)
     test_ms_sum = sum(int(r.get('test_ms') or 0) for r in rows)
     sandbox_ms_sum = sum(int(r.get('sandbox_ms') or 0) for r in rows)
+    cases_declared = sum(int(r.get('cases_declared') or 0) for r in rows)
+    cases_total = sum(int(r.get('cases_total') or 0) for r in rows)
+    cases_passed = sum(int(r.get('cases_passed') or 0) for r in rows)
+    diagnosed_samples = sum(1 for r in rows if int(r.get('cases_total') or 0) > 0
+                            and (r.get('test_case_status') or '') in ('OK', 'DISCRETE', 'PARTIAL'))
+    undiagnosed_samples = sum(1 for r in rows if int(r.get('cases_total') or 0) == 0
+                              and (r.get('test_case_status') or '') not in ('', 'NOT_RUN_COMPILE_ERROR'))
     inference_done = len(rows) - inference_failed - input_too_long
     try:
         cfg = json.loads(run['config_json'] or '{}')
@@ -811,7 +1256,10 @@ def _progress_from_db(run_id: int) -> dict[str, Any]:
         'infra_errors': counts.get('INFRA_ERROR', 0),
         'excluded': inference_failed + counts.get('INFRA_ERROR', 0),
         'inference_concurrency': int(cfg.get('inference_concurrency') or 0) if active else 0,
-        'compile_concurrency': int(cfg.get('compile_concurrency') or 0) if active else 0,
+        'auto_limit': 0,
+        'auto_max_inflight': AUTO_MAX_INFLIGHT if active and int(cfg.get('inference_concurrency') or 0) == 0 else 0,
+        'compile_concurrency': _compile_limit(int(cfg.get('compile_concurrency') or COMPILE_CONCURRENCY)) if active else 0,
+        'compile_concurrency_requested': int(cfg.get('compile_concurrency') or COMPILE_CONCURRENCY) if active else 0,
         'max_pending_compile': int(cfg.get('max_pending_compile') or MAX_PENDING_COMPILE),
         'generation_mode': cfg.get('generation_mode') or 'online',
         'batch_size': int(cfg.get('batch_size') or 0),
@@ -822,6 +1270,11 @@ def _progress_from_db(run_id: int) -> dict[str, Any]:
         'compile_ms_sum': compile_ms_sum,
         'test_ms_sum': test_ms_sum,
         'sandbox_ms_sum': sandbox_ms_sum,
+        'cases_declared': cases_declared,
+        'cases_total': cases_total,
+        'cases_passed': cases_passed,
+        'diagnosed_samples': diagnosed_samples,
+        'undiagnosed_samples': undiagnosed_samples,
         'inference_ms_avg': round(inference_ms_sum / inference_done, 1) if inference_done else 0.0,
         'inference_rate': round(inference_done / elapsed, 3) if elapsed else 0.0,
         'eval_rate': round(evaluated / elapsed, 3) if elapsed else 0.0,

@@ -54,6 +54,9 @@ class EvalOutcome:
     harness_mode: str = 'cases'
     harness_note: str = ''
     failure_reason: str = ''
+    cases: list[dict] = field(default_factory=list)
+    diagnostic_status: str = ''
+    case_coverage: dict = field(default_factory=dict)
 
     def detail(self) -> str:
         """Structured payload persisted in results.detail_json."""
@@ -70,10 +73,13 @@ class EvalOutcome:
                 'stderr': self.compile_stderr,
             },
             'tests': self.tests,
+            'diagnostic_status': self.diagnostic_status,
+            'case_count': len(self.cases),
+            'case_coverage': self.case_coverage,
         }, ensure_ascii=False, default=str)
 
 
-RUNNER_SOURCE = r'''
+RUNNER_SOURCE = r"""
 import json
 import os
 import subprocess
@@ -97,14 +103,14 @@ def read_capped(path, limit):
     return raw.decode("utf-8", "replace"), size, size > limit
 
 
-def run(cmd, timeout, out_path, err_path):
+def run(cmd, timeout, out_path, err_path, env=None):
     start = time.perf_counter()
     timed_out = False
     rc = None
     with open(out_path, "wb") as out, open(err_path, "wb") as err:
         try:
             rc = subprocess.run(cmd, stdout=out, stderr=err, timeout=timeout,
-                                check=False).returncode
+                                env=env, check=False).returncode
         except subprocess.TimeoutExpired:
             timed_out = True
         except OSError as exc:
@@ -140,12 +146,125 @@ def event(kind, result, out_path, err_path, limit, index=None):
     emit(obj)
 
 
+def read_records(path, limit=16384):
+    try:
+        with open(path, "rb") as fp:
+            data = fp.read()
+    except OSError:
+        return []
+    fields = data.split(b"\0")
+    records = []
+    i = 0
+    while i + 11 < len(fields):
+        if fields[i + 11] != b"END":
+            i += 1
+            continue
+
+        def dec(value):
+            return value.decode("utf-8", "replace")[:limit]
+
+        try:
+            record = {
+                "index": int(fields[i]),
+                "static_id": int(fields[i + 1]),
+                "line": int(fields[i + 2]),
+                "passed": fields[i + 3] == b"1",
+                "actual_ok": fields[i + 4] == b"1",
+                "expected_ok": fields[i + 5] == b"1",
+                "expression": dec(fields[i + 6]),
+                "lhs": dec(fields[i + 7]),
+                "rhs": dec(fields[i + 8]),
+                "actual": dec(fields[i + 9]),
+                "expected": dec(fields[i + 10]),
+            }
+        except ValueError:
+            i += 12
+            continue
+        records.append(record)
+        i += 12
+    return records
+
+
+def run_diag_cases(program, max_cases, test_timeout, log_limit):
+    records_path = "/work/dec_cases.bin"
+    failures = []
+    k = 1
+    status = "OK"
+    while k <= max_cases:
+        try:
+            os.remove(records_path)
+        except FileNotFoundError:
+            pass
+        env = dict(os.environ)
+        env["DEC_DIAG_STOP"] = str(k)
+        env["DEC_DIAG_SKIP"] = ",".join(str(item) for item in failures)
+        env["DEC_DIAG_PATH"] = records_path
+        result = run([program], test_timeout, "/work/diag.out", "/work/diag.err", env=env)
+        duration = result.get("duration_ms", 0)
+        timed_out = bool(result.get("timed_out"))
+        rc = result.get("returncode")
+        records = read_records(records_path)
+        prior = [r for r in records if not r["passed"] and r["index"] < k
+                 and r["index"] not in failures]
+        if prior:
+            failures = sorted(set(failures + [min(r["index"] for r in prior)]))
+            continue
+        record = next((r for r in records if r["index"] == k), None)
+        if record is not None:
+            out, out_size, out_trunc = read_capped("/work/diag.out", log_limit)
+            err, err_size, err_trunc = read_capped("/work/diag.err", log_limit)
+            emit({
+                "type": "case",
+                "index": k,
+                "static_id": record["static_id"],
+                "line": record["line"],
+                "expression": record["expression"],
+                "lhs": record["lhs"],
+                "rhs": record["rhs"],
+                "actual": record["actual"],
+                "expected": record["expected"],
+                "actual_ok": record["actual_ok"],
+                "expected_ok": record["expected_ok"],
+                "passed": record["passed"],
+                "after_prior_failure": bool(failures) and k > min(failures),
+                "duration_ms": duration,
+                "exit_code": rc if rc is not None and rc >= 0 else None,
+                "signal": -rc if rc is not None and rc < 0 else None,
+                "timed_out": timed_out,
+                "stdout": out,
+                "stderr": err,
+                "stdout_truncated": out_trunc,
+                "stderr_truncated": err_trunc,
+                "stdout_bytes": out_size,
+                "stderr_bytes": err_size,
+            })
+            if not record["passed"]:
+                failures = sorted(set(failures + [k]))
+            k += 1
+            continue
+        if timed_out:
+            status = "TIMEOUT"
+            break
+        if rc not in (0, 3):
+            status = "CRASH"
+            break
+        if k == 1:
+            status = "NO_CASES_EXECUTED"
+        break
+    else:
+        status = "SCAN_LIMIT"
+    emit({"type": "diag_done", "status": status, "cases": k - 1,
+          "max_cases": max_cases, "failures": failures})
+
+
 def main():
     language = sys.argv[1]
     total = int(sys.argv[2])
     compile_timeout = float(sys.argv[3])
     test_timeout = float(sys.argv[4])
     limit = int(sys.argv[5])
+    diagnostic = sys.argv[6] == "1" if len(sys.argv) > 6 else False
+    max_cases = int(sys.argv[7]) if len(sys.argv) > 7 else 0
     source = "/input/program.cpp" if language == "cpp" else "/input/program.c"
     compiler = "g++" if language == "cpp" else "gcc"
     std = "-std=c++17" if language == "cpp" else "-std=c11"
@@ -153,15 +272,34 @@ def main():
 
     result = run(compiler_cmd, compile_timeout, "/work/compile.out", "/work/compile.err")
     event("compile", result, "/work/compile.out", "/work/compile.err", limit)
-    if result.get("spawn_error") or result.get("timed_out") or result.get("returncode") != 0:
-        emit({"type": "done", "tests": 0, "compiled": False})
+    compiled = not (result.get("spawn_error") or result.get("timed_out")
+                    or result.get("returncode") != 0)
+    if not compiled:
+        emit({"type": "done", "tests": 0, "compiled": False, "diag": diagnostic})
         return
 
     for index in range(total):
         result = run(["/work/program", str(index)], test_timeout,
                      "/work/test.out", "/work/test.err")
         event("test", result, "/work/test.out", "/work/test.err", limit, index=index)
-    emit({"type": "done", "tests": total, "compiled": True})
+
+    if diagnostic and max_cases > 0:
+        diag_std = "-std=gnu++17" if language == "cpp" else "-std=gnu11"
+        diag_source = "/input/program_diag.cpp" if language == "cpp" else "/input/program_diag.c"
+        diag_cmd = [compiler, diag_std, "-O0", "-w", diag_source,
+                    "-o", "/work/program_diag", "-lm"]
+        diag_result = run(diag_cmd, compile_timeout,
+                          "/work/diag_compile.out", "/work/diag_compile.err")
+        event("diag_compile", diag_result, "/work/diag_compile.out",
+              "/work/diag_compile.err", limit)
+        if not (diag_result.get("spawn_error") or diag_result.get("timed_out")
+                or diag_result.get("returncode") != 0):
+            run_diag_cases("/work/program_diag", max_cases, test_timeout, limit)
+        else:
+            emit({"type": "diag_done", "status": "DIAG_COMPILE_ERROR",
+                  "cases": 0, "max_cases": max_cases, "failures": []})
+
+    emit({"type": "done", "tests": total, "compiled": True, "diag": diagnostic})
 
 
 if __name__ == "__main__":
@@ -170,7 +308,7 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         sys.exit(2)
-'''
+"""
 
 
 def extract_c(text: str) -> str:
@@ -185,7 +323,8 @@ def harness_mode(tests: list[dict]) -> str:
 
 
 HARNESS_NOTE_PROGRAM = ('完整 harness：Test 0 是整套测试程序的一次执行，'
-                        '不是第 1 个 assert 断言；TCP 按 1 个用例计算。')
+                        '不是第 1 个 assert 断言。官方 RE 以该次执行为准；'
+                        'TCP 由独立诊断用例单独计算（不可提取时为 N/A）。')
 
 
 def build_c_file(candidate: str, dependencies: str, tests: list[dict]) -> str:
@@ -285,7 +424,8 @@ def parse_events(raw: str) -> tuple[list[dict], list[str]]:
             except json.JSONDecodeError:
                 noise.append(line)
                 continue
-            if isinstance(obj, dict) and obj.get('type') in ('compile', 'test', 'done'):
+            if isinstance(obj, dict) and obj.get('type') in (
+                    'compile', 'test', 'done', 'case', 'diag_compile', 'diag_done'):
                 events.append(obj)
                 continue
         noise.append(line)
@@ -366,6 +506,13 @@ def outcome_from_events(events: list[dict], total_tests: int, mode: str,
     reason = '; '.join(f"Test {r['index']}: {r['reason']}" for r in failures
                        if r['reason'])[:600]
     run_log = _capped(_format_run_log(records, note, reason), 20000)
+    case_events = [ev for ev in events if ev.get('type') == 'case']
+    diag_done = next((ev for ev in reversed(events) if ev.get('type') == 'diag_done'), None)
+    coverage = {}
+    if diag_done:
+        coverage = {'executed': int(diag_done.get('cases') or 0),
+                    'max_cases': int(diag_done.get('max_cases') or 0),
+                    'failures': diag_done.get('failures') if isinstance(diag_done.get('failures'), list) else []}
     return EvalOutcome(status, True, passed, total_tests,
                        compile_log=compile_log, run_log=run_log, error=reason,
                        compile_ms=compile_ms, test_ms=test_ms,
@@ -373,7 +520,9 @@ def outcome_from_events(events: list[dict], total_tests: int, mode: str,
                        compile_timed_out=compile_timed_out,
                        compile_stdout=compile_stdout, compile_stderr=compile_stderr,
                        tests=records, harness_mode=mode, harness_note=note,
-                       failure_reason=reason)
+                       failure_reason=reason, cases=case_events,
+                       diagnostic_status=(diag_done or {}).get('status', ''),
+                       case_coverage=coverage)
 
 
 def _format_run_log(records: list[dict], note: str, reason: str) -> str:
@@ -439,7 +588,8 @@ def parse_docker_output(raw: str, total_tests: int,
 
 def _docker_command(path: Path, language: str, total_tests: int,
                     compile_timeout: int, test_timeout: int, log_limit: int,
-                    docker_bin: str = 'docker') -> list[str]:
+                    docker_bin: str = 'docker', diagnostic: dict | None = None,
+                    max_cases: int = 0) -> list[str]:
     # Resource limits intentionally unchanged from v0.2; the container is
     # networkless, read-only, unprivileged and has its own tmpfs workdir.
     return [
@@ -453,16 +603,27 @@ def _docker_command(path: Path, language: str, total_tests: int,
         '--mount', f'type=bind,source={path},target=/input,readonly',
         SANDBOX_IMAGE, 'python3', '/input/runner.py', language, str(total_tests),
         str(compile_timeout), str(test_timeout), str(log_limit),
+        '1' if diagnostic else '0', str(max_cases),
     ]
 
 
 def _prepare_input(candidate: str, dependencies: str, tests: list[dict],
-                   language: str, temp: str) -> Path:
+                   language: str, temp: str, diagnostic: dict | None = None) -> Path:
     path = Path(temp)
     source = build_c_file(candidate, dependencies, tests)
     src = path / ('program.cpp' if language == 'cpp' else 'program.c')
     src.write_text(source, encoding='utf-8')
     (path / 'runner.py').write_text(RUNNER_SOURCE, encoding='utf-8')
+    if diagnostic and diagnostic.get('harness'):
+        harness = diagnostic['harness']
+        diag_source = dependencies + '\n' + candidate + '\n' + harness + '\n'
+        diag = path / ('program_diag.cpp' if language == 'cpp' else 'program_diag.c')
+        diag.write_text(diag_source, encoding='utf-8')
+        header = diagnostic.get('header') or ''
+        if header:
+            (path / 'dec_diag.h').write_text(header, encoding='utf-8')
+            os.chmod(path / 'dec_diag.h', 0o644)
+        os.chmod(diag, 0o644)
     # Read access for unprivileged uid=65534 inside a read-only bind mount.
     os.chmod(path, 0o755)
     os.chmod(src, 0o644)
@@ -483,7 +644,8 @@ def evaluate_code(prediction: str, dependencies: str, tests: list[dict],
                   language: str = 'c', *, compile_timeout: int = COMPILE_TIMEOUT,
                   test_timeout: int = TEST_TIMEOUT,
                   log_limit: int = LOG_LIMIT_BYTES,
-                  docker_bin: str = 'docker') -> EvalOutcome:
+                  docker_bin: str = 'docker',
+                  diagnostic: dict | None = None) -> EvalOutcome:
     """Synchronous sandbox entry point (scripts, model checks, tests).
 
     No host compilation fallback is provided: a missing Docker engine is an
@@ -501,12 +663,18 @@ def evaluate_code(prediction: str, dependencies: str, tests: list[dict],
         return EvalOutcome('COMPILE_ERROR', False, 0, len(tests),
                            error='Generated source exceeds MVP size limit.')
     mode = harness_mode(tests)
-    with tempfile.TemporaryDirectory(prefix='deceval_') as temp:
-        path = _prepare_input(candidate, dependencies, tests, language, temp)
+    tmp_root = os.getenv('DEC_EVAL_TMP_DIR') or os.getenv('TMPDIR') or None
+    if tmp_root:
+        os.makedirs(tmp_root, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='deceval_', dir=tmp_root) as temp:
+        path = _prepare_input(candidate, dependencies, tests, language, temp,
+                              diagnostic=diagnostic)
+        max_cases = int((diagnostic or {}).get('max_cases') or 0)
         cmd = _docker_command(path, language, len(tests), compile_timeout,
-                              test_timeout, log_limit, docker_bin)
+                              test_timeout, log_limit, docker_bin,
+                              diagnostic=diagnostic, max_cases=max_cases)
         overall = min(MAX_CONTAINER_LIFETIME,
-                      compile_timeout + test_timeout * len(tests) + 90)
+                      compile_timeout + test_timeout * (len(tests) + max_cases) + 120)
         try:
             out = subprocess.run(cmd, capture_output=True, timeout=overall, check=False)
         except FileNotFoundError:
@@ -522,7 +690,7 @@ def evaluate_code(prediction: str, dependencies: str, tests: list[dict],
             return EvalOutcome('INFRA_ERROR', None, 0, len(tests),
                                error=f'Docker error: {exc}')
         return _outcome_from_process(out.returncode, out.stdout, out.stderr,
-                                     len(tests), mode, log_limit)
+                                     len(tests), mode, log_limit, bool(diagnostic))
 
 
 async def evaluate_code_async(prediction: str, dependencies: str, tests: list[dict],
@@ -530,7 +698,8 @@ async def evaluate_code_async(prediction: str, dependencies: str, tests: list[di
                               compile_timeout: int = COMPILE_TIMEOUT,
                               test_timeout: int = TEST_TIMEOUT,
                               log_limit: int = LOG_LIMIT_BYTES,
-                              docker_bin: str = 'docker') -> EvalOutcome:
+                              docker_bin: str = 'docker',
+                              diagnostic: dict | None = None) -> EvalOutcome:
     """Async sandbox entry point used by the concurrent pipeline.
 
     Docker runs as an asyncio subprocess, so the event loop keeps serving
@@ -548,12 +717,18 @@ async def evaluate_code_async(prediction: str, dependencies: str, tests: list[di
         return EvalOutcome('COMPILE_ERROR', False, 0, len(tests),
                            error='Generated source exceeds MVP size limit.')
     mode = harness_mode(tests)
-    with tempfile.TemporaryDirectory(prefix='deceval_') as temp:
-        path = _prepare_input(candidate, dependencies, tests, language, temp)
+    tmp_root = os.getenv('DEC_EVAL_TMP_DIR') or os.getenv('TMPDIR') or None
+    if tmp_root:
+        os.makedirs(tmp_root, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='deceval_', dir=tmp_root) as temp:
+        path = _prepare_input(candidate, dependencies, tests, language, temp,
+                              diagnostic=diagnostic)
+        max_cases = int((diagnostic or {}).get('max_cases') or 0)
         cmd = _docker_command(path, language, len(tests), compile_timeout,
-                              test_timeout, log_limit, docker_bin)
+                              test_timeout, log_limit, docker_bin,
+                              diagnostic=diagnostic, max_cases=max_cases)
         overall = min(MAX_CONTAINER_LIFETIME,
-                      compile_timeout + test_timeout * len(tests) + 90)
+                      compile_timeout + test_timeout * (len(tests) + max_cases) + 120)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -581,12 +756,13 @@ async def evaluate_code_async(prediction: str, dependencies: str, tests: list[di
                 pass
             raise
         return _outcome_from_process(proc.returncode, stdout, stderr,
-                                     len(tests), mode, log_limit)
+                                     len(tests), mode, log_limit, bool(diagnostic))
 
 
 def _outcome_from_process(returncode: int | None, stdout: bytes | str | None,
                           stderr: bytes | str | None, total_tests: int,
-                          mode: str, log_limit: int) -> EvalOutcome:
+                          mode: str, log_limit: int,
+                          diagnostic_requested: bool = False) -> EvalOutcome:
     raw = stdout.decode('utf-8', 'replace') if isinstance(stdout, bytes) else (stdout or '')
     err = stderr.decode('utf-8', 'replace') if isinstance(stderr, bytes) else (stderr or '')
     events, noise = parse_events(raw)
@@ -606,6 +782,12 @@ def _outcome_from_process(returncode: int | None, stdout: bytes | str | None,
             error=(_capped(err, 2500) or f'Sandbox runner exited with code {returncode}.'),
             harness_mode=mode,
             harness_note=HARNESS_NOTE_PROGRAM if mode == 'program' else '')
-    return outcome_from_events(events, total_tests, mode,
-                               raw_noise='\n'.join(noise), stderr_text=err,
-                               log_limit=log_limit)
+    outcome = outcome_from_events(events, total_tests, mode,
+                                   raw_noise='\n'.join(noise), stderr_text=err,
+                                   log_limit=log_limit)
+    if diagnostic_requested and not outcome.diagnostic_status:
+        if outcome.status in ('COMPILE_ERROR', 'COMPILE_TIMEOUT'):
+            outcome.diagnostic_status = 'NOT_RUN_COMPILE_ERROR'
+        elif not outcome.cases:
+            outcome.diagnostic_status = 'NO_CASES_EXECUTED'
+    return outcome

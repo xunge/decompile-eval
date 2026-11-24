@@ -43,7 +43,7 @@ class RunCreate(_OptimizationMixin):
     max_tokens: int = Field(default=1024,ge=128,le=8192)
     # None means "use the server default" so environment configuration stays
     # authoritative unless the client explicitly overrides it.
-    inference_concurrency: int | None = Field(default=None, ge=1, le=MAX_INFERENCE_CONCURRENCY)
+    inference_concurrency: int | None = Field(default=None, ge=0, le=MAX_INFERENCE_CONCURRENCY)
     compile_concurrency: int | None = Field(default=None, ge=1, le=MAX_COMPILE_CONCURRENCY)
 
 

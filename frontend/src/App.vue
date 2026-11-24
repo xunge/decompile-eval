@@ -14,13 +14,17 @@ const datasetSamples = ref([])
 const selectedRun = ref(null)
 const selectedResult = ref(null)
 const progress = ref(null)
+const testCases = ref(null)
+const caseFilter = ref('all')
+const casePage = ref(1)
+const casePageSize = ref(20)
 const comparisons = ref([])
 const compareIds = ref([])
 const uploadFile = ref(null)
 const offlineFile = ref(null)
 const datasetForm = ref({name:'自定义数据集',version:'v1',description:''})
 const modelForm = ref({name:'',kind:'openai',base_url:'http://127.0.0.1:8001/v1',api_model:'',api_mode:'completion',api_key_env:'',system_prompt:'You are an expert binary decompiler. Output only valid C source code.'})
-const runForm = ref({dataset_id:null,model_id:null,optimizations:['O0','O1','O2','O3'],sample_limit:0,max_tokens:1024,temperature:0,inference_concurrency:128,compile_concurrency:4,generation_mode:'online',model_path:'',batch_size:32,prompt_template:'# This is the assembly code:\n{assembly}\n# What is the source code?\n'})
+const runForm = ref({dataset_id:null,model_id:null,optimizations:['O0','O1','O2','O3'],sample_limit:0,max_tokens:1024,temperature:0,inference_concurrency:0,compile_concurrency:64,generation_mode:'online',model_path:'',batch_size:32,prompt_template:'# This is the assembly code:\n{assembly}\n# What is the source code?\n'})
 const offlineForm = ref({dataset_id:null,name:'离线结果导入'})
 
 const nav = [
@@ -29,7 +33,7 @@ const nav = [
   ['runs','≡','评测任务'],['compare','▥','模型对比']
 ]
 const titles = {'overview':'评测总览','datasets':'数据集管理','models':'模型管理','newrun':'新建评测任务','runs':'评测任务','compare':'模型对比'}
-const statusLabel = {'queued':'排队中','running':'评测中','cancel_requested':'停止中','completed':'已完成','completed_with_errors':'部分基础设施失败','cancelled':'已停止','interrupted':'已中断','TEST_PASS':'测试通过','WRONG_ANSWER':'结果错误','COMPILE_ERROR':'编译失败','COMPILE_TIMEOUT':'编译超时','RUNTIME_ERROR':'运行异常','TIMEOUT':'执行超时','INFRA_ERROR':'沙箱错误','INFERENCE_ERROR':'模型接口错误','MODEL_EMPTY':'空输出','GENERATED':'已生成待编译','COMPILING':'编译测试中','PASS':'通过','ASSERT_FAILURE':'断言失败','INPUT_TOO_LONG':'输入超长'}
+const statusLabel = {'PASS':'通过','FAIL':'失败','NOT_RUN_COMPILE_ERROR':'编译失败未运行','NOT_RUN_DIAG_ERROR':'诊断无法运行','NOT_EXECUTED':'未执行','queued':'排队中','running':'评测中','cancel_requested':'停止中','completed':'已完成','completed_with_errors':'部分基础设施失败','cancelled':'已停止','interrupted':'已中断','TEST_PASS':'测试通过','WRONG_ANSWER':'结果错误','COMPILE_ERROR':'编译失败','COMPILE_TIMEOUT':'编译超时','RUNTIME_ERROR':'运行异常','TIMEOUT':'执行超时','INFRA_ERROR':'沙箱错误','INFERENCE_ERROR':'模型接口错误','MODEL_EMPTY':'空输出','GENERATED':'已生成待编译','COMPILING':'编译测试中','PASS':'通过','ASSERT_FAILURE':'断言失败','INPUT_TOO_LONG':'输入超长'}
 const statusText = s => statusLabel[s] || s || '—'
 const percent = v => v === null || v === undefined ? 'N/A' : `${Number(v).toFixed(1)}%`
 const rate = v => v === null || v === undefined ? 0 : Math.max(0,Math.min(100,Number(v)))
@@ -152,7 +156,53 @@ async function fetchProgress() {
   try { progress.value=await request(`/runs/${selectedRun.value.run.id}/progress`) } catch(e) { /* transient */ }
 }
 async function showRun(id) {await safely(async()=>{await loadRun(id);active.value='runs'})}
-async function showResult(id) {await safely(async()=>{selectedResult.value=await request(`/results/${id}`)})}
+async function showResult(id) {
+  await safely(async()=>{
+    selectedResult.value=await request(`/results/${id}`)
+    testCases.value=null;caseFilter.value='all';casePage.value=1
+    await loadTestCases(1)
+  })
+}
+async function loadTestCases(page=1) {
+  if(!selectedResult.value || !selectedRun.value)return
+  const rid=selectedRun.value.run.id
+  const status=caseFilter.value==='all'?'':caseFilter.value
+  const data=await request(`/runs/${rid}/results/${selectedResult.value.id}/test-cases?status=${encodeURIComponent(status)}&page=${page}&page_size=${casePageSize.value}`)
+  testCases.value=data;casePage.value=page
+}
+function setCaseFilter(f) {
+  caseFilter.value=f;loadTestCases(1).catch(e=>{error.value=e.message || String(e)})
+}
+function changeCasePage(delta) {
+  if(!testCases.value)return
+  const max=Math.max(1,Math.ceil(testCases.value.total/casePageSize.value))
+  const next=Math.min(max,Math.max(1,casePage.value+delta))
+  loadTestCases(next).catch(e=>{error.value=e.message || String(e)})
+}
+function exportCases(format) {
+  if(!selectedResult.value || !selectedRun.value)return
+  const url=`/api/runs/${selectedRun.value.run.id}/results/${selectedResult.value.id}/test-cases?export=${format}`
+  window.open(url,'_blank')
+}
+const caseTagClass = s => s==='PASS' ? 'TEST_PASS' : s==='FAIL' ? 'WRONG_ANSWER' : s&&s.startsWith('NOT_RUN') ? 'INFRA_ERROR' : 'TIMEOUT'
+const caseCoverage = computed(() => {
+  const s=testCases.value?.summary
+  if(!s || !s.cases_declared)return null
+  return s.coverage
+})
+const diagnosticConsistent = computed(() => testCases.value?.summary?.diagnostic_consistent)
+const caseMaxPage = computed(() => testCases.value ? Math.max(1,Math.ceil(testCases.value.total/casePageSize.value)) : 1)
+const bottleneckText = computed(() => {
+  const p = prog.value
+  if(!p || !p.total || !['running','cancel_requested'].includes(p.status)) return ''
+  const vm = p.vllm_metrics
+  if(vm && vm.num_requests_waiting > 0) return `vLLM 排队中（waiting=${vm.num_requests_waiting}），GPU 可能在处理其它任务或被限流。`
+  if((p.waiting_inference || 0) > 0 && (p.inferring || 0) === 0)
+    return `仍有 ${p.waiting_inference} 个样本待推理，但当前没有在途请求：检查调度/连接池/取消状态。`
+  if((p.waiting_inference || 0) === 0 && ((p.compiling || 0) > 0 || (p.waiting_compile || 0) > 0))
+    return `推理已无待处理样本，GPU 空闲；当前瓶颈是 Docker 编译/测试（编译中 ${p.compiling||0}，等待 ${p.waiting_compile||0}）。`
+  return ''
+})
 async function runAction(id,action) {
   await safely(async()=>{
     await request(`/runs/${id}/${action}`,{method:'POST'})
@@ -242,7 +292,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
     </aside>
 
     <main class="main">
-      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> {{titles[active]}}</div><div class="topright"><span class="pill soft">v0.4 · 动态并发</span><span class="avatar">DE</span></div></header>
+      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> {{titles[active]}}</div><div class="topright"><span class="pill soft">v0.5 · 真实TCP</span><span class="avatar">DE</span></div></header>
       <section class="content">
         <div v-if="error" class="notice error"><strong>操作失败</strong>　{{error}}<button @click="error=''">×</button></div>
         <div v-if="message" class="notice success">{{message}}<button @click="message=''">×</button></div>
@@ -319,7 +369,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               </template>
               <div class="field-label">优化等级</div><div class="check-row"><label v-for="o in ['O0','O1','O2','O3']" :key="o" class="check"><input type="checkbox" :checked="runForm.optimizations.includes(o)" @change="toggleOpt(o)"/>{{o}}</label></div>
               <div class="two-inputs"><label>样本数量上限（0=全部）<input v-model.number="runForm.sample_limit" type="number" min="0" max="12000" /></label><label>最大 Token 数<input v-model.number="runForm.max_tokens" type="number" min="128" max="8192" /></label></div>
-              <div class="two-inputs"><label>推理并发数<input v-model.number="runForm.inference_concurrency" type="number" min="1" max="512" /></label><label>编译并发数<input v-model.number="runForm.compile_concurrency" type="number" min="1" max="32" /></label></div>
+              <div class="two-inputs"><label>推理并发数（0=AUTO）<input v-model.number="runForm.inference_concurrency" type="number" min="0" max="512" title="0 = AUTO 自适应持续投递" /></label><label>编译并发数<input v-model.number="runForm.compile_concurrency" type="number" min="1" max="128" /></label></div>
               <label>Prompt 模板<textarea v-model="runForm.prompt_template" rows="5"></textarea></label>
               <p class="tip">使用 <code>{assembly}</code> 占位符。不能向模型输入参考 C 代码或测试用例。推理与编译并发数受服务端上限约束。</p>
               <button class="primary wide" :disabled="loading" @click="startRun">▶ {{ runForm.generation_mode==='offline_batch' ? '创建并执行离线批量评测' : '创建并执行评测' }}</button>
@@ -360,8 +410,8 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               </div>
               <div class="progress-grid"><div v-for="item in progressItems" :key="item.label" class="progress-cell"><small>{{item.label}}</small><strong>{{item.value ?? 0}}</strong></div></div>
               <div class="progress-meta">
-                <span>推理并发 <b>{{prog.inference_concurrency || '—'}}</b></span>
-                <span>编译并发 <b>{{prog.compile_concurrency || '—'}}</b></span>
+                <span>推理并发 <b>{{prog.inference_concurrency === 0 ? 'AUTO (0)' : (prog.inference_concurrency || '—')}}</b><small v-if="prog.auto_max_inflight"> · 当前上限 {{prog.auto_limit || '—'}} / {{prog.auto_max_inflight}}</small></span>
+                <span>编译并发 <b>{{prog.compile_concurrency || '—'}}</b><small v-if="prog.compile_concurrency_requested && prog.compile_concurrency_requested !== prog.compile_concurrency"> · 请求 {{prog.compile_concurrency_requested}}</small></span>
                 <span>在途请求 <b>{{prog.in_flight || 0}}</b></span>
                 <span>推理请求数 <b>{{prog.inference_requests || 0}}</b></span>
                 <span>推理吞吐 <b>{{fmtRate(prog.inference_rate)}}</b></span>
@@ -378,13 +428,27 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
                 <span v-if="prog.vllm_metrics?.gpu_cache_usage_perc !== undefined">KV 缓存 <b>{{Math.round(prog.vllm_metrics.gpu_cache_usage_perc * 100)}}%</b></span>
               </div>
               <p v-if="selectedRun.run.config?.reference" class="tip"><b>参考源码基线任务：</b>失败代表数据集或评测环境问题，不能当作模型错误，也不能从模型 RE 分母中删除。</p>
+              <p v-if="bottleneckText" class="tip"><b>瓶颈提示：</b>{{bottleneckText}}</p>
               <p v-if="selectedRun.run.error" class="danger-text">{{selectedRun.run.error}}</p>
-              <div class="score-grid"><div v-for="score in [{name:'RC · 编译率',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'TCP · 测试通过率',value:selectedRun.metrics.tcp}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
-              <p class="tip">可统计样本 {{selectedRun.metrics.evaluated}} 个，基础设施/推理错误排除 {{selectedRun.metrics.excluded}} 个。RE 为整组测试全部通过的样本比例。</p>
+              <div class="score-grid"><div v-for="score in [{name:'RC · 编译率',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'TCP micro · 用例加权',value:selectedRun.metrics.tcp_micro},{name:'TCP macro · 函数平均',value:selectedRun.metrics.tcp_macro}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
+              <p class="tip">可统计样本 {{selectedRun.metrics.evaluated}} 个，基础设施/推理错误排除 {{selectedRun.metrics.excluded}} 个。RE 为官方完整 harness 全部通过的样本比例；TCP micro = 通过原子用例/有效原子用例，TCP macro = 每个可诊断函数通过率的平均。metric {{selectedRun.metrics.metric_version || 'legacy'}}。
+                <span v-if="selectedRun.metrics.tcp_micro === null || selectedRun.metrics.tcp_micro === undefined"> 旧结果没有逐用例信息，TCP=N/A，需重新诊断评测。</span></p>
+              <div class="progress-meta case-metrics">
+                <span>诊断样本 <b>{{selectedRun.metrics.diagnosed_samples || 0}} / {{selectedRun.metrics.evaluated}}</b></span>
+                <span>case 覆盖 <b>{{selectedRun.metrics.cases_passed || 0}} / {{selectedRun.metrics.cases_total || 0}}</b></span>
+                <span>声明用例 <b>{{selectedRun.metrics.cases_declared || 0}}</b></span>
+                <span>覆盖率 <b>{{selectedRun.metrics.case_coverage === null || selectedRun.metrics.case_coverage === undefined ? 'N/A' : percent(selectedRun.metrics.case_coverage)}}</b></span>
+                <span>不可诊断样本 <b>{{selectedRun.metrics.unsupported_samples || 0}}</b></span>
+                <span>未覆盖用例 <b>{{selectedRun.metrics.uncovered_cases || 0}}</b></span>
+                <span>官方 RE 分母 <b>{{selectedRun.metrics.official_re_denominator ?? '—'}}</b></span>
+              </div>
+              <div class="progress-meta" v-if="selectedRun.metrics.failure_type_counts && Object.keys(selectedRun.metrics.failure_type_counts).length">
+                <span v-for="(n,s) in selectedRun.metrics.failure_type_counts" :key="s">失败类型 <b>{{statusText(s)}}: {{n}}</b></span>
+              </div>
               <h3>不同优化等级</h3><div class="opt-cards"><div v-for="(item,opt) in selectedRun.by_optimization" :key="opt" class="opt-card"><strong>{{opt}}</strong><small>{{item.evaluated}} 个有效样本</small><div>RC <b>{{percent(item.rc)}}</b></div><div>RE <b>{{percent(item.re)}}</b></div></div></div>
             </div>
             <div class="panel"><div class="panel-head"><div><h2>样本级评测结果</h2><p>点击查看源代码、模型输出、编译和运行日志</p></div></div>
-              <div class="table-wrap"><table><thead><tr><th>样本 ID</th><th>优化</th><th>编译</th><th>通过测试</th><th>状态</th><th>耗时(推/编/测)</th><th></th></tr></thead><tbody><tr v-for="x in selectedRun.results" :key="x.id"><td class="mono">{{x.sample_key}}</td><td>{{x.optimization}}</td><td>{{x.compile_success===null?'—':x.compile_success?'✓':'✕'}}</td><td>{{x.tests_passed}} / {{x.tests_total}}</td><td><span class="tag" :class="x.status">{{statusText(x.status)}}</span></td><td>{{x.inference_ms||0}} / {{x.compile_ms||0}} / {{x.test_ms||0}} ms</td><td><button class="ghost" @click="showResult(x.id)">查看 →</button></td></tr><tr v-if="!selectedRun.results.length"><td colspan="7" class="empty">尚无已完成样本</td></tr></tbody></table></div>
+              <div class="table-wrap"><table><thead><tr><th>样本 ID</th><th>优化</th><th>编译</th><th>官方测试</th><th>诊断用例</th><th>状态</th><th>诊断状态</th><th>耗时(推/编/测)</th><th></th></tr></thead><tbody><tr v-for="x in selectedRun.results" :key="x.id"><td class="mono">{{x.sample_key}}</td><td>{{x.optimization}}</td><td>{{x.compile_success===null?'—':x.compile_success?'✓':'✕'}}</td><td>{{x.tests_passed}} / {{x.tests_total}}</td><td>{{x.cases_passed||0}} / {{x.cases_total||0}} <small>({{x.cases_declared||0}})</small></td><td><span class="tag" :class="x.status">{{statusText(x.status)}}</span></td><td><span class="tag">{{x.test_case_status || '—'}}</span></td><td>{{x.inference_ms||0}} / {{x.compile_ms||0}} / {{x.test_ms||0}} ms</td><td><button class="ghost" @click="showResult(x.id)">查看 →</button></td></tr><tr v-if="!selectedRun.results.length"><td colspan="9" class="empty">尚无已完成样本</td></tr></tbody></table></div>
             </div>
           </div>
         </template>
@@ -411,9 +475,49 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
         <span>Token <b>{{selectedResult.prompt_tokens||0}} / {{selectedResult.completion_tokens||0}}</b></span>
         <span>Harness <b>{{selectedResult.harness_mode==='program'?'完整程序（Test 0 = 整套一次执行）':'独立用例'}}</b></span>
       </div>
+      <div class="modal-meta" v-if="selectedResult.submitted_at || selectedResult.compile_started_at">
+        <span v-if="selectedResult.submitted_at">提交 <b>{{dateTime(selectedResult.submitted_at)}}</b></span>
+        <span v-if="selectedResult.generated_at">生成完成 <b>{{dateTime(selectedResult.generated_at)}}</b></span>
+        <span v-if="selectedResult.first_token_at">首 token <b>{{dateTime(selectedResult.first_token_at)}}</b></span>
+        <span v-else>首 token <b>N/A（非流式接口）</b></span>
+        <span v-if="selectedResult.compile_started_at">编译开始 <b>{{dateTime(selectedResult.compile_started_at)}}</b></span>
+        <span v-if="selectedResult.compile_finished_at">编译结束 <b>{{dateTime(selectedResult.compile_finished_at)}}</b></span>
+      </div>
       <p v-if="selectedResult.harness_note" class="tip">{{selectedResult.harness_note}}</p>
       <p v-if="selectedResult.failure_reason || selectedResult.error" class="danger-text">失败原因：{{selectedResult.failure_reason || selectedResult.error}}</p>
       <p v-if="selectedResult.generation_params && Object.keys(selectedResult.generation_params).length" class="tip">生成参数：max_tokens {{selectedResult.generation_params.max_tokens_requested ?? '—'}} → {{selectedResult.generation_params.max_tokens_effective ?? '—'}} · tokenizer {{selectedResult.generation_params.tokenizer || '—'}} · temperature {{selectedResult.generation_params.temperature ?? '—'}}</p>
+      <div class="case-diagnostic">
+        <div class="panel-head"><div><h3>官方 harness 结果 vs 逐用例诊断</h3><p>RE 始终以官方完整 harness 为准；TCP 仅使用可拆分的诊断用例。</p></div><div class="actions"><button class="ghost" @click="exportCases('json')">导出 JSON</button><button class="ghost" @click="exportCases('csv')">导出 CSV</button></div></div>
+        <div v-if="!testCases" class="empty">正在加载逐用例结果…</div>
+        <template v-else>
+          <div class="case-summary">
+            <span>官方 harness <b class="tag" :class="selectedResult.status">{{statusText(selectedResult.status)}}</b> · {{selectedResult.tests_passed}}/{{selectedResult.tests_total}}</span>
+            <span>诊断状态 <b>{{testCases.summary.test_case_status || '—'}}</b></span>
+            <span>用例 <b>{{testCases.summary.cases_passed}} / {{testCases.summary.cases_total}}</b>（声明 {{testCases.summary.cases_declared}}）</span>
+            <span>用例覆盖 <b>{{testCases.summary.coverage === null ? 'N/A' : percent(testCases.summary.coverage)}}</b></span>
+            <span>指标版本 <b>{{testCases.summary.metric_version || '—'}}</b></span>
+          </div>
+          <p v-if="diagnosticConsistent === false" class="notice error">诊断用例结果与官方 harness 不一致：RE 以官方结果为准；请查看诊断限制/转换风险，禁止静默覆盖。</p>
+          <p v-if="!testCases.summary.cases_declared" class="tip">旧结果没有逐用例信息（或该 harness 不可拆分）：TCP=N/A，请重新运行诊断评测。不能把一次完整 harness 的执行当成 1 个逻辑用例。</p>
+          <div v-if="testCases.summary.cases_declared" class="case-filters">
+            <button v-for="f in [['all','全部'],['pass','通过'],['fail','失败'],['unsupported','无法诊断']]" :key="f[0]" class="ghost" :class="{active:caseFilter===f[0]}" @click="setCaseFilter(f[0])">{{f[1]}}</button>
+            <span class="tip">共 {{testCases.total}} 条</span>
+          </div>
+          <div v-if="testCases.items.length" class="table-wrap"><table class="case-table"><thead><tr><th>#</th><th>case</th><th>输入 / 实际</th><th>预期</th><th>状态</th><th>诊断</th><th>日志</th></tr></thead><tbody>
+            <tr v-for="c in testCases.items" :key="c.id">
+              <td class="mono">{{c.case_index}}</td>
+              <td class="mono">{{c.case_id}}<small v-if="c.case_source_span_json?.start_line"> · L{{c.case_source_span_json.start_line}}</small></td>
+              <td class="case-value"><div>{{c.input_text || '—'}}</div><div class="case-actual">actual: {{c.actual_text || '—'}}</div></td>
+              <td class="case-value">{{c.expected_text || '—'}}</td>
+              <td><span class="tag" :class="caseTagClass(c.status)">{{statusText(c.status) || c.status}}</span><small v-if="c.error_type && c.error_type!=='NONE'"> {{c.error_type}}</small></td>
+              <td class="case-value"><span>{{c.diagnostic_status || '—'}}</span><small v-if="c.comparison_rule"> · {{c.comparison_rule}}</small><small v-if="c.signal"> · signal {{c.signal}}</small><small v-if="c.exit_code!==null && c.exit_code!==undefined"> · exit {{c.exit_code}}</small></td>
+              <td><details v-if="c.stdout || c.stderr"><summary>stdout/stderr</summary><pre v-if="c.stdout">[stdout]{{'\n'}}{{c.stdout}}</pre><pre v-if="c.stderr">[stderr]{{'\n'}}{{c.stderr}}</pre><small v-if="c.stdout_truncated || c.stderr_truncated">（日志已截断）</small></details><span v-else class="tip">—</span></td>
+            </tr>
+          </tbody></table></div>
+          <div v-else class="empty">没有符合筛选条件的用例。未执行/无法拆分的用例会显式标记，不会伪造 PASS/FAIL。</div>
+          <div v-if="testCases.total > casePageSize" class="case-pager"><button class="ghost" :disabled="casePage<=1" @click="changeCasePage(-1)">上一页</button><span>第 {{casePage}} / {{caseMaxPage}} 页</span><button class="ghost" :disabled="casePage>=caseMaxPage" @click="changeCasePage(1)">下一页</button></div>
+        </template>
+      </div>
       <div class="code-grid"><div><div class="code-title">输入汇编</div><pre>{{selectedResult.assembly}}</pre></div><div><div class="code-title">模型原始输出</div><pre>{{selectedResult.model_output || '(无输出)'}}</pre></div><div><div class="code-title">提取后的 C 代码</div><pre>{{selectedResult.extracted_source || '(空)'}}</pre></div><div><div class="code-title">参考 C 源代码（不提供给模型）</div><pre>{{selectedResult.reference_source}}</pre></div></div>
       <details v-if="selectedResult.prompt_text" class="prompt-details"><summary>实际发送给模型的 Prompt</summary><pre>{{selectedResult.prompt_text}}</pre></details>
       <div v-if="selectedResult.tests_detail?.length" class="tests-detail"><h3>逐用例执行</h3>

@@ -3,11 +3,12 @@ from contextlib import asynccontextmanager
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+import hashlib
 import json
 import threading
 import time
 import uuid
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 from .config import (DATA_DIR, CORS_ORIGINS, MAX_UPLOAD_BYTES, MAX_SAMPLES,
@@ -18,6 +19,7 @@ from .schemas import ModelCreate, RunCreate, ReferenceCheckCreate, BatchRunCreat
 from .worker import submit_run, get_progress, clear_progress, REFERENCE_MODEL_NAME
 from .adapters import OfflineBatchAdapter, fetch_vllm_metrics
 from .sandbox import extract_c
+from .case_extract import METRIC_VERSION
 
 EXCLUDED={'INFRA_ERROR','INFERENCE_ERROR'}
 # Rows that exist before the sample reaches a final state are never counted in
@@ -32,7 +34,7 @@ async def lifespan(app: FastAPI):
     seed_demo()
     yield
 
-app=FastAPI(title='DecompileEval MVP', version='0.4.0', lifespan=lifespan)
+app=FastAPI(title='DecompileEval MVP', version='0.5.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=CORS_ORIGINS,allow_credentials=False,
                    allow_methods=['*'],allow_headers=['*'])
 
@@ -172,7 +174,7 @@ def _read_jsonl(raw:bytes):
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'version':'0.4.0','sandbox':'docker-required','pipeline':'async'}
+    return {'ok':True,'version':'0.5.0','sandbox':'docker-required','pipeline':'async'}
 
 @app.get('/api/overview')
 def overview():
@@ -199,9 +201,11 @@ async def import_dataset(name:str=Form(...),version:str=Form('v1'),description:s
         raise HTTPException(422,'Upload a .jsonl file')
     raw=await file.read(MAX_UPLOAD_BYTES+1)
     parsed=_read_jsonl(raw)
+    source_hash=hashlib.sha256(raw).hexdigest()
     with connect() as db:
-        cur=db.execute('INSERT INTO datasets(name,version,description,created_at) VALUES(?,?,?,?)',
-                       (name.strip(),version,description[:1000],now()))
+        cur=db.execute('INSERT INTO datasets(name,version,description,source_hash,created_at) '
+                       'VALUES(?,?,?,?,?)',
+                       (name.strip(),version,description[:1000],source_hash,now()))
         did=cur.lastrowid
         for s in parsed:
             db.execute('''INSERT INTO samples(dataset_id,sample_key,problem_id,optimization,compiler,architecture,language,
@@ -274,7 +278,7 @@ def _select_samples(db, dataset_id:int, opts:list[str], limit:int):
 @app.post('/api/runs',status_code=201)
 def create_run(body:RunCreate):
     with connect() as db:
-        required(db,'datasets',body.dataset_id)
+        dataset=required(db,'datasets',body.dataset_id)
         selected_model=required(db,'models',body.model_id)
         if selected_model['kind']=='offline':
             raise HTTPException(422,'Offline models must be imported via /api/runs/offline')
@@ -284,11 +288,17 @@ def create_run(body:RunCreate):
         if not samples:
             raise HTTPException(422,'No samples match the selected conditions')
         cfg=body.model_dump()
-        cfg['inference_concurrency']=body.inference_concurrency or INFERENCE_CONCURRENCY
-        cfg['compile_concurrency']=body.compile_concurrency or COMPILE_CONCURRENCY
+        cfg['inference_concurrency']=(body.inference_concurrency
+                                      if body.inference_concurrency is not None
+                                      else INFERENCE_CONCURRENCY)
+        cfg['compile_concurrency']=(body.compile_concurrency
+                                    if body.compile_concurrency is not None
+                                    else COMPILE_CONCURRENCY)
         cfg['generation_mode']='online'
         cfg['batch_size']=0
         cfg['max_model_len']=MAX_MODEL_LEN
+        cfg['dataset_hash']=dataset['source_hash']
+        cfg['dataset_version']=dataset['version']
         cur=db.execute('''INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at)
                 VALUES(?,?,?,?,?,?)''',(body.dataset_id,body.model_id,'queued',len(samples),
                                         json.dumps(cfg,ensure_ascii=False),now()))
@@ -316,7 +326,7 @@ async def import_offline_run(dataset_id:int=Form(...),name:str=Form('Offline pre
     except (KeyError,UnicodeError,ValueError,TypeError) as exc:
         raise HTTPException(422,str(exc)[:400])
     with connect() as db:
-        required(db,'datasets',dataset_id)
+        dataset=required(db,'datasets',dataset_id)
         samples=list(db.execute('SELECT sample_key FROM samples WHERE dataset_id=?',(dataset_id,)))
         allowed={s['sample_key'] for s in samples}
         if not set(mapping).issubset(allowed):
@@ -328,7 +338,8 @@ async def import_offline_run(dataset_id:int=Form(...),name:str=Form('Offline pre
         cfg={'dataset_id':dataset_id,'model_id':mid,'optimizations':['O0','O1','O2','O3','Os','Ofast'],
              'sample_limit':0,'prompt_template':'offline predictions','temperature':0,'max_tokens':1024,
              'inference_concurrency':1,'compile_concurrency':COMPILE_CONCURRENCY,
-             'generation_mode':'online','batch_size':0,'max_model_len':MAX_MODEL_LEN}
+             'generation_mode':'online','batch_size':0,'max_model_len':MAX_MODEL_LEN,
+             'dataset_hash':dataset['source_hash'],'dataset_version':dataset['version']}
         rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) VALUES(?,?,?,?,?,?)',
                        (dataset_id,mid,'queued',len(samples),'{}',now())).lastrowid
         file_dir=DATA_DIR/'offline'
@@ -351,7 +362,7 @@ def create_batch_run(body:BatchRunCreate):
         raise HTTPException(503,'The vLLM Python package is not installed in the backend '
                                 'environment; use the online adapter or install vllm.')
     with connect() as db:
-        required(db,'datasets',body.dataset_id)
+        dataset=required(db,'datasets',body.dataset_id)
         selected_model=required(db,'models',body.model_id)
         if selected_model['kind'] in ('offline','reference'):
             raise HTTPException(422,'Offline-batch runs require a normal model entry')
@@ -363,8 +374,12 @@ def create_batch_run(body:BatchRunCreate):
         cfg['model_path']=model_path
         cfg['batch_size']=body.batch_size or OFFLINE_BATCH_SIZE
         cfg['inference_concurrency']=cfg['batch_size']
-        cfg['compile_concurrency']=body.compile_concurrency or COMPILE_CONCURRENCY
+        cfg['compile_concurrency']=(body.compile_concurrency
+                                    if body.compile_concurrency is not None
+                                    else COMPILE_CONCURRENCY)
         cfg['max_model_len']=MAX_MODEL_LEN
+        cfg['dataset_hash']=dataset['source_hash']
+        cfg['dataset_version']=dataset['version']
         rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) '
                        'VALUES(?,?,?,?,?,?)',(body.dataset_id,body.model_id,'queued',len(samples),
                                               json.dumps(cfg,ensure_ascii=False),now())).lastrowid
@@ -382,7 +397,7 @@ def reference_check(dataset_id:int,body:ReferenceCheckCreate|None=None):
     """
     body=body or ReferenceCheckCreate()
     with connect() as db:
-        required(db,'datasets',dataset_id)
+        dataset=required(db,'datasets',dataset_id)
         model=db.execute("SELECT id FROM models WHERE kind='reference' AND name=?",
                          (REFERENCE_MODEL_NAME,)).fetchone()
         mid=model['id'] if model else db.execute(
@@ -395,14 +410,100 @@ def reference_check(dataset_id:int,body:ReferenceCheckCreate|None=None):
              'sample_limit':body.sample_limit,
              'prompt_template':'reference source (no model call)','temperature':0,'max_tokens':128,
              'inference_concurrency':1,
-             'compile_concurrency':body.compile_concurrency or COMPILE_CONCURRENCY,
+             'compile_concurrency':(body.compile_concurrency
+                                    if body.compile_concurrency is not None
+                                    else COMPILE_CONCURRENCY),
              'generation_mode':'online','batch_size':0,'max_model_len':MAX_MODEL_LEN,
+             'dataset_hash':dataset['source_hash'],'dataset_version':dataset['version'],
              'reference':True}
         rid=db.execute('INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at) '
                        'VALUES(?,?,?,?,?,?)',(dataset_id,mid,'queued',len(samples),
                                               json.dumps(cfg,ensure_ascii=False),now())).lastrowid
     submit_run(rid)
     return {'run_id':rid,'status':'queued','total':len(samples),'reference':True}
+
+
+@app.get('/api/runs/{run_id}/results/{result_id}/test-cases')
+def result_test_cases(run_id:int, result_id:int,
+                      status:str=Query('',description='PASS/FAIL/unsupported or empty'),
+                      page:int=Query(1,ge=1), page_size:int=Query(50,ge=1,le=500),
+                      export:str=Query('',description='json or csv')):
+    with connect() as db:
+        result=db.execute('SELECT * FROM results WHERE id=? AND run_id=?',
+                          (result_id,run_id)).fetchone()
+        if result is None:
+            raise HTTPException(404,'Result not found')
+        all_status=[dict(r) for r in db.execute(
+            'SELECT status,COUNT(*) AS n FROM test_case_results '
+            'WHERE run_id=? AND sample_id=? GROUP BY status',(run_id,result['sample_id']))]
+        where='run_id=? AND sample_id=?'
+        args=[run_id,result['sample_id']]
+        filt=(status or '').strip()
+        if filt.lower()=='pass':
+            where+=' AND status=?'; args.append('PASS')
+        elif filt.lower()=='fail':
+            where+=' AND status=?'; args.append('FAIL')
+        elif filt.lower()=='unsupported':
+            where+=" AND status NOT IN ('PASS','FAIL')"
+        elif filt:
+            where+=' AND status=?'; args.append(filt.upper())
+        total=db.execute(f'SELECT COUNT(*) FROM test_case_results WHERE {where}',args).fetchone()[0]
+        params=list(args)
+        query=f'SELECT * FROM test_case_results WHERE {where} ORDER BY case_index,id'
+        if export.lower() not in ('json','csv'):
+            query+=' LIMIT ? OFFSET ?'; params += [page_size,(page-1)*page_size]
+        rows=[dict(r) for r in db.execute(query,params)]
+    for row in rows:
+        for key in ('case_source_span',):
+            raw=row.get(key) or ''
+            if raw:
+                try: row[key+'_json']=json.loads(raw)
+                except ValueError: row[key+'_json']={}
+        for key in ('expected_value_json','actual_value_json','input_values_json'):
+            raw=row.get(key) or ''
+            if raw:
+                try: row[key+'_parsed']=json.loads(raw)
+                except ValueError: row[key+'_parsed']=None
+        for key in ('stdout','stderr'):
+            row[key]=row.get(key) or ''
+    counts={item['status']:item['n'] for item in all_status}
+    executed=sum(counts.get(s,0) for s in ('PASS','FAIL'))
+    passed=counts.get('PASS',0)
+    official=result['status']
+    consistent=None
+    if executed:
+        consistent=(official=='TEST_PASS')==(passed==executed)
+    meta={
+        'run_id':run_id,'result_id':result_id,'sample_id':result['sample_id'],
+        'official_status':official,'official_tests_passed':result['tests_passed'],
+        'official_tests_total':result['tests_total'],
+        'test_case_status':result['test_case_status'],
+        'cases_declared':result['cases_declared'],
+        'cases_total':result['cases_total'],'cases_passed':result['cases_passed'],
+        'coverage':round(min(100.0, 100*result['cases_total'] /
+                             max(result['cases_declared'], result['cases_total'])),2)
+                    if result['cases_declared'] else None,
+        'diagnostic_consistent':consistent,
+        'case_status_counts':counts,'metric_version':result['metric_version'],
+    }
+    if export.lower()=='csv':
+        import csv as _csv, io as _io
+        out=_io.StringIO()
+        columns=['case_id','case_index','static_id','status','passed','error_type',
+                 'input_text','expected_text','actual_text','compare_expression',
+                 'comparison_rule','oracle_source','diagnostic_status','exit_code',
+                 'signal','duration_ms','stdout','stderr','case_source_span']
+        writer=_csv.writer(out)
+        writer.writerow(columns)
+        for row in rows:
+            writer.writerow([row.get(c,'') for c in columns])
+        return Response(content=out.getvalue(), media_type='text/csv',
+                        headers={'Content-Disposition':
+                                 f'attachment; filename="run{run_id}_result{result_id}_cases.csv"'})
+    if export.lower()=='json':
+        return {'summary':meta,'total':total,'items':rows,'export':'json'}
+    return {'summary':meta,'total':total,'page':page,'page_size':page_size,
+            'items':rows}
 
 
 def summarize(rows:list[dict]):
@@ -415,11 +516,41 @@ def summarize(rows:list[dict]):
     status_counts={}
     for item in rows:
         status_counts[item['status']]=status_counts.get(item['status'],0)+1
+    # Case-level TCP is only meaningful when the result rows carry case data.
+    has_case_columns=any('cases_total' in x for x in rows)
+    case_rows=[x for x in eligible if int(x.get('cases_total') or 0)>0]
+    case_total=sum(int(x.get('cases_total') or 0) for x in case_rows)
+    case_passed=sum(int(x.get('cases_passed') or 0) for x in case_rows)
+    case_declared=sum(int(x.get('cases_declared') or 0) for x in eligible)
+    tcp_micro=round(100*case_passed/case_total,2) if case_total else None
+    ratios=[int(x.get('cases_passed') or 0)/int(x.get('cases_total') or 1)
+            for x in case_rows]
+    tcp_macro=round(100*sum(ratios)/len(ratios),2) if ratios else None
+    if has_case_columns:
+        tcp=tcp_micro
+        metric_version=METRIC_VERSION
+    else:
+        # Legacy rows (or unit-test rows without diagnostics) keep the old
+        # tests_passed/tests_total definition; never invent case-level TCP.
+        tcp=round(100*tp/tt,2) if tt else None
+        metric_version='legacy'
+    diagnosed_samples=len(case_rows)
+    coverage=round(100*diagnosed_samples/n,2) if n else None
+    unsupported=sum(1 for x in eligible
+                    if (x.get('test_case_status') or '') not in
+                    ('','OK','DISCRETE','PARTIAL','NOT_RUN_COMPILE_ERROR'))
     return {'evaluated':n,'excluded':len(rows)-n,'rc':round(100*cp/n,2) if n else None,
             're':round(100*re/n,2) if n else None,
-            'tcp':round(100*tp/tt,2) if tt else None,
+            'tcp':tcp,'tcp_micro':tcp_micro,'tcp_macro':tcp_macro,
             'compile_pass':cp,'re_pass':re,'test_pass':tp,'test_total':tt,
-            'status_counts':status_counts}
+            'cases_declared':case_declared,'cases_total':case_total,
+            'cases_passed':case_passed,'diagnosed_samples':diagnosed_samples,
+            'case_coverage':coverage,'unsupported_samples':unsupported,
+            'official_re_denominator':n,'tcp_valid_cases':case_total,
+            'uncovered_cases':max(0,case_declared-case_total),
+            'uncovered_samples':max(0,n-diagnosed_samples),
+            'failure_type_counts':{k:v for k,v in status_counts.items() if k!='TEST_PASS'},
+            'metric_version':metric_version,'status_counts':status_counts}
 
 @app.get('/api/runs')
 def list_runs():
@@ -442,6 +573,9 @@ def get_run(run_id:int):
             r.tests_passed,r.tests_total,r.inference_ms,r.compile_ms,r.test_ms,
             r.sandbox_ms,r.latency_ms,
             r.prompt_tokens,r.completion_tokens,r.error,
+            r.cases_declared,r.cases_total,r.cases_passed,r.test_case_status,
+            r.metric_version,r.submitted_at,r.generated_at,r.first_token_at,
+            r.compile_started_at,r.compile_finished_at,
             s.sample_key,s.problem_id,s.optimization,s.compiler
             FROM results r JOIN samples s ON r.sample_id=s.id
             WHERE r.run_id=? ORDER BY s.id''',(run_id,))]

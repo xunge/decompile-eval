@@ -34,7 +34,8 @@ def initialize():
         CREATE TABLE IF NOT EXISTS datasets (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           name TEXT NOT NULL, version TEXT NOT NULL DEFAULT 'v1',
-          description TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+          description TEXT NOT NULL DEFAULT '', source_hash TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS samples (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,7 +60,8 @@ def initialize():
           model_id INTEGER NOT NULL REFERENCES models(id),
           status TEXT NOT NULL, total INTEGER NOT NULL, completed INTEGER NOT NULL DEFAULT 0,
           config_json TEXT NOT NULL, created_at TEXT NOT NULL,
-          started_at TEXT, finished_at TEXT, error TEXT NOT NULL DEFAULT ''
+          started_at TEXT, finished_at TEXT, error TEXT NOT NULL DEFAULT '',
+          metric_version TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS results (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +81,16 @@ def initialize():
           completion_tokens INTEGER NOT NULL DEFAULT 0,
           prompt_text TEXT NOT NULL DEFAULT '',
           generation_params_json TEXT NOT NULL DEFAULT '',
+          cases_declared INTEGER NOT NULL DEFAULT 0,
+          cases_total INTEGER NOT NULL DEFAULT 0,
+          cases_passed INTEGER NOT NULL DEFAULT 0,
+          test_case_status TEXT NOT NULL DEFAULT '',
+          metric_version TEXT NOT NULL DEFAULT '',
+          submitted_at TEXT NOT NULL DEFAULT '',
+          generated_at TEXT NOT NULL DEFAULT '',
+          first_token_at TEXT NOT NULL DEFAULT '',
+          compile_started_at TEXT NOT NULL DEFAULT '',
+          compile_finished_at TEXT NOT NULL DEFAULT '',
           detail_json TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL,
           UNIQUE(run_id, sample_id)
@@ -86,6 +98,49 @@ def initialize():
         CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
         CREATE INDEX IF NOT EXISTS idx_samples_ds ON samples(dataset_id);
         CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status);
+        CREATE TABLE IF NOT EXISTS case_manifests (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+          harness_hash TEXT NOT NULL,
+          parser_version TEXT NOT NULL,
+          status TEXT NOT NULL,
+          manifest_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(sample_id, harness_hash, parser_version)
+        );
+        CREATE TABLE IF NOT EXISTS test_case_results (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+          sample_id INTEGER NOT NULL REFERENCES samples(id),
+          case_id TEXT NOT NULL,
+          case_index INTEGER NOT NULL,
+          static_id INTEGER NOT NULL DEFAULT -1,
+          case_source_span TEXT NOT NULL DEFAULT '',
+          input_text TEXT NOT NULL DEFAULT '',
+          input_values_json TEXT NOT NULL DEFAULT '',
+          expected_text TEXT NOT NULL DEFAULT '',
+          expected_value_json TEXT NOT NULL DEFAULT '',
+          actual_text TEXT NOT NULL DEFAULT '',
+          actual_value_json TEXT NOT NULL DEFAULT '',
+          compare_expression TEXT NOT NULL DEFAULT '',
+          comparison_rule TEXT NOT NULL DEFAULT '',
+          passed INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          exit_code INTEGER,
+          signal INTEGER,
+          stdout TEXT NOT NULL DEFAULT '',
+          stderr TEXT NOT NULL DEFAULT '',
+          stdout_truncated INTEGER NOT NULL DEFAULT 0,
+          stderr_truncated INTEGER NOT NULL DEFAULT 0,
+          duration_ms INTEGER NOT NULL DEFAULT 0,
+          oracle_source TEXT NOT NULL DEFAULT '',
+          diagnostic_status TEXT NOT NULL DEFAULT '',
+          error_type TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          UNIQUE(run_id, sample_id, case_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_case_results_result ON test_case_results(run_id,sample_id);
+        CREATE INDEX IF NOT EXISTS idx_case_results_status ON test_case_results(run_id,status);
         ''')
         # Preserve pre-existing SQLite installations when adding model API mode.
         model_cols={r[1] for r in db.execute('PRAGMA table_info(models)')}
@@ -102,10 +157,23 @@ def initialize():
             ('completion_tokens', 'INTEGER NOT NULL DEFAULT 0'),
             ('prompt_text', "TEXT NOT NULL DEFAULT ''"),
             ('generation_params_json', "TEXT NOT NULL DEFAULT ''"),
+            ('cases_declared', 'INTEGER NOT NULL DEFAULT 0'),
+            ('cases_total', 'INTEGER NOT NULL DEFAULT 0'),
+            ('cases_passed', 'INTEGER NOT NULL DEFAULT 0'),
+            ('test_case_status', "TEXT NOT NULL DEFAULT ''"),
+            ('metric_version', "TEXT NOT NULL DEFAULT ''"),
+            ('submitted_at', "TEXT NOT NULL DEFAULT ''"),
+            ('generated_at', "TEXT NOT NULL DEFAULT ''"),
+            ('first_token_at', "TEXT NOT NULL DEFAULT ''"),
+            ('compile_started_at', "TEXT NOT NULL DEFAULT ''"),
+            ('compile_finished_at', "TEXT NOT NULL DEFAULT ''"),
             ('detail_json', "TEXT NOT NULL DEFAULT ''"),
         ):
             _ensure_column(db, 'results', column, ddl)
         db.execute('CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status)')
+        _ensure_column(db, 'runs', 'metric_version', "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, 'datasets', 'source_hash', "TEXT NOT NULL DEFAULT ''")
+        db.execute('CREATE INDEX IF NOT EXISTS idx_results_case_status ON results(run_id,test_case_status)')
         # A run that was interrupted by a server restart must never be shown as actively running.
         db.execute("UPDATE runs SET status='interrupted', error='Server restarted; select Retry to resume.' WHERE status IN ('running','queued')")
 

@@ -84,7 +84,12 @@ def ensure_large_dataset(count=200):
 
 def fixture_model_id():
     with db.connect() as conn:
-        return conn.execute("SELECT id FROM models WHERE kind='fixture' LIMIT 1").fetchone()[0]
+        row = conn.execute("SELECT id FROM models WHERE kind='fixture' LIMIT 1").fetchone()
+    if row is None:
+        db.seed_demo()
+        with db.connect() as conn:
+            row = conn.execute("SELECT id FROM models WHERE kind='fixture' LIMIT 1").fetchone()
+    return row[0]
 
 
 def create_run(limit=8, ic=4, cc=2, did=None, generation_mode='online', batch_size=0):
@@ -174,6 +179,7 @@ class Recorder:
         self.inference_starts = []
         self.inference_finishes = []
         self.delay_for = None
+        self.started_while_active = False
 
     async def infer(self, model, sample, cfg, client):
         key = sample['sample_key']
@@ -181,6 +187,8 @@ class Recorder:
         delay = (self.delay_for(key) if self.delay_for else
                  self.infer_delay + (index % 5) * 0.01)
         with self.lock:
+            if self.infer_active > 0:
+                self.started_while_active = True
             self.infer_active += 1
             self.max_infer = max(self.max_infer, self.infer_active)
             self.inference_keys.append(key)
@@ -671,8 +679,10 @@ def test_attach_vllm_metrics_is_cached(monkeypatch):
 
 def test_default_concurrency_matches_config():
     from app.config import INFERENCE_CONCURRENCY, COMPILE_CONCURRENCY
-    assert INFERENCE_CONCURRENCY == 128 and COMPILE_CONCURRENCY == 4
-    assert worker._resolve_concurrency({}) == (INFERENCE_CONCURRENCY, COMPILE_CONCURRENCY)
+    assert INFERENCE_CONCURRENCY == 0 and COMPILE_CONCURRENCY == 64
+    inference, compile_effective = worker._resolve_concurrency({})
+    assert inference == 0
+    assert 1 <= compile_effective <= 64
 
 
 def test_batch_endpoint_creates_and_runs(monkeypatch):
@@ -717,3 +727,45 @@ def test_batch_endpoint_creates_and_runs(monkeypatch):
         assert detail['run']['config']['batch_size'] == 2
         assert all(r['status'] == 'TEST_PASS' for r in detail['results'])
         client.delete(f'/api/runs/{rid}')
+
+
+def test_auto_mode_keeps_supplying_and_is_bounded(monkeypatch):
+    from app.config import AUTO_INITIAL_INFLIGHT, AUTO_MAX_INFLIGHT
+    did = ensure_large_dataset(120)
+    rid = create_run(limit=120, ic=0, cc=2, did=did)
+    rec = Recorder(infer_delay=0.08, compile_delay=0.001)
+    install(monkeypatch, rec)
+    worker.process_run(rid)
+
+    rows = sampled_rows(rid)
+    assert len(rows) == 120 and all(r['status'] == 'TEST_PASS' for r in rows)
+    assert AUTO_INITIAL_INFLIGHT < rec.max_infer <= AUTO_MAX_INFLIGHT
+    assert rec.started_while_active is True, 'AUTO must refill while requests are still running'
+    progress = worker.get_progress(rid)
+    assert progress['inference_concurrency'] == 0
+    assert AUTO_INITIAL_INFLIGHT <= progress['auto_limit'] <= AUTO_MAX_INFLIGHT
+    assert progress['evaluated'] == 120
+
+
+def test_fixed_16_mode_keeps_existing_limit(monkeypatch):
+    did = ensure_large_dataset(120)
+    rid = create_run(limit=40, ic=16, cc=2, did=did)
+    rec = Recorder(infer_delay=0.05, compile_delay=0.001)
+    install(monkeypatch, rec)
+    worker.process_run(rid)
+    assert 8 <= rec.max_infer <= 16
+    assert worker.get_progress(rid)['inference_concurrency'] == 16
+
+
+def test_compile_concurrency_default_override_and_resource_guard(monkeypatch):
+    from app.config import COMPILE_CONCURRENCY
+    assert COMPILE_CONCURRENCY == 64
+    monkeypatch.setattr(worker, '_memory_available_mb', lambda: 4096)
+    monkeypatch.setattr(worker.os, 'cpu_count', lambda: 8)
+    # 4 GiB * 0.6 / 1 GiB per worker = 2, below the requested 64.
+    assert worker._compile_limit(64) == 2
+    assert worker._compile_limit(4) == 2
+    assert worker._resolve_concurrency({'compile_concurrency': 4})[1] == 2
+    monkeypatch.setattr(worker, '_memory_available_mb', lambda: None)
+    assert worker._compile_limit(64) == 8
+    assert worker._resolve_concurrency({'compile_concurrency': 8})[1] == 8

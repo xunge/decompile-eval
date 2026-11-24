@@ -27,11 +27,20 @@ MAX_SOURCE_CHARS = 500_000
 # per-run values for the two concurrency limits are stored in the run config.
 # 128 in-flight requests is the vLLM-friendly default: the scheduler refills a
 # slot as soon as any request finishes, so the GPU never waits for the batch.
-INFERENCE_CONCURRENCY = _env_int('INFERENCE_CONCURRENCY', 128, 1, 512)
-COMPILE_CONCURRENCY = _env_int('COMPILE_CONCURRENCY', 4, 1, 64)
+INFERENCE_CONCURRENCY = _env_int('INFERENCE_CONCURRENCY', 0, 0, 512)
+COMPILE_CONCURRENCY = _env_int('COMPILE_CONCURRENCY', 64, 1, 128)
 MAX_PENDING_COMPILE = _env_int('MAX_PENDING_COMPILE', 128, 1, 4096)
 MAX_INFERENCE_CONCURRENCY = 512
-MAX_COMPILE_CONCURRENCY = 32
+
+# AUTO mode (INFERENCE_CONCURRENCY=0): bounded continuous supply with a
+# dynamically growing in-flight ceiling.  The ceiling is a resource guard, not
+# a user-specified batch size; every completed request is replaced immediately.
+AUTO_INITIAL_INFLIGHT = _env_int('AUTO_INITIAL_INFLIGHT', 32, 1, 512)
+AUTO_MAX_INFLIGHT = _env_int('AUTO_MAX_INFLIGHT', 256, 1, 1024)
+AUTO_STEP = _env_int('AUTO_STEP', 16, 1, 256)
+COMPILE_MEMORY_FRACTION = float(os.getenv('COMPILE_MEMORY_FRACTION', '0.6') or 0.6)
+COMPILE_MEMORY_PER_WORKER_MB = _env_int('COMPILE_MEMORY_PER_WORKER_MB', 1024, 128, 8192)
+MAX_COMPILE_CONCURRENCY = 128
 
 # Context safety. The tokenizer is the real model tokenizer exposed by vLLM at
 # POST /tokenize; max_tokens is reduced only when prompt+output would cross the
@@ -47,6 +56,11 @@ OFFLINE_BATCH_SIZE = _env_int('DEC_EVAL_BATCH_SIZE', 32, 1, 4096)
 # Optional vLLM Prometheus metrics (/metrics) attached to the progress API.
 VLLM_METRICS_ENABLED = os.getenv('DEC_EVAL_VLLM_METRICS', '1').strip().lower() not in ('0', 'false', 'no')
 VLLM_METRICS_TIMEOUT = 0.8
+
+# Per-case diagnostics extracted from the official harness.  The official
+# harness remains the only RE oracle; diagnostics only add case-level TCP.
+DIAGNOSTICS_ENABLED = os.getenv('DEC_EVAL_DIAGNOSTICS', '1').strip().lower() not in ('0', 'false', 'no')
+MAX_DIAGNOSTIC_CASES = _env_int('MAX_DIAGNOSTIC_CASES', 200, 1, 2000)
 
 INFERENCE_TIMEOUT = _env_int('INFERENCE_TIMEOUT', 180, 5, 3600)
 INFERENCE_RETRIES = _env_int('INFERENCE_RETRIES', 2, 0, 10)
