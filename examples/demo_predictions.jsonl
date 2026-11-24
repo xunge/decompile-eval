@@ -1,0 +1,4 @@
+{"sample_id":"demo_sum_O0","prediction":"int sum_two(int a, int b) { return a + b; }"}
+{"sample_id":"demo_max_O2","prediction":"int max_two(int a, int b) { return a > b ? a : b; }"}
+{"sample_id":"demo_even_O2","prediction":"int is_even(int n) { return (n & 1) == 0; }"}
+{"sample_id":"demo_square_O0","prediction":"int square(int n) { return n * n; }"}

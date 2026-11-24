@@ -1,0 +1,56 @@
+# ---------------------------------------------------------------------------
+# DecompileEval MVP
+# 原则：源码、脚本、示例与文档必须入库；依赖、运行时数据、密钥、缓存一律忽略。
+# ---------------------------------------------------------------------------
+
+# ---- Python 虚拟环境与打包产物 -------------------------------------------
+.venv/
+.bench-env/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# ---- Python 测试 / 类型检查 / 覆盖率缓存 ---------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---- Node / 前端构建产物与依赖 -------------------------------------------
+node_modules/
+frontend/dist/
+.vite/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- 运行时数据（可由 scripts/ 重新下载、转换或由上传操作重建）-----------
+# data/    : data/raw 原始基准、data/import 转换后的 JSONL，体积大且可复现
+# storage/ : SQLite 数据库、离线预测文件、上传缓存
+data/
+storage/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# ---- 本地配置与密钥（只保留脱敏模板）------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---- 日志、临时文件、编辑器 / 操作系统杂物 -------------------------------
+*.log
+*.tmp
+*.temp
+*.swp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
