@@ -227,3 +227,43 @@ def test_uncovered_cases_and_samples_are_reported():
     assert metrics['official_re_denominator'] == 2
     assert metrics['uncovered_samples'] == 1
     assert metrics['case_coverage'] == 50.0
+
+
+def test_rc_uses_official_source_compile_and_keeps_harness_rate():
+    metrics = summarize([
+        {'status': 'COMPILE_ERROR', 'compile_success': 0, 'source_compile_ok': 1,
+         'compile_stage': 'harness', 'tests_passed': 0, 'tests_total': 1},
+        {'status': 'TEST_PASS', 'compile_success': 1, 'source_compile_ok': 1,
+         'compile_stage': 'ok', 'tests_passed': 1, 'tests_total': 1},
+        {'status': 'COMPILE_ERROR', 'compile_success': 0, 'source_compile_ok': 0,
+         'compile_stage': 'source', 'tests_passed': 0, 'tests_total': 1},
+    ])
+    assert metrics['rc'] == 66.67
+    assert metrics['rc_source'] == 66.67
+    assert metrics['rc_harness'] == 33.33
+    assert metrics['source_compile_pass'] == 2
+    assert metrics['rc_mode'] == 'official_source_compile'
+
+
+def test_legacy_rc_mode_is_reported():
+    metrics = summarize([{'status': 'TEST_PASS', 'compile_success': 1,
+                          'tests_passed': 1, 'tests_total': 1}])
+    assert metrics['rc'] == 100.0
+    assert metrics['rc_mode'] == 'legacy_harness_compile'
+    assert metrics['rc_source'] is None
+
+
+def test_oracle_and_invalid_benchmark_are_excluded_from_model_metrics():
+    metrics = summarize([
+        {'status': 'TEST_PASS', 'compile_success': 1, 'source_compile_ok': 1,
+         'tests_passed': 2, 'tests_total': 2, 'cases_declared': 2,
+         'cases_total': 2, 'cases_passed': 2},
+        {'status': 'ORACLE_ERROR', 'compile_success': 0, 'source_compile_ok': 0,
+         'tests_passed': 0, 'tests_total': 3},
+        {'status': 'INVALID_BENCHMARK', 'compile_success': None,
+         'source_compile_ok': None, 'tests_passed': 0, 'tests_total': 1},
+    ])
+    assert metrics['evaluated'] == 1
+    assert metrics['excluded'] == 2
+    assert metrics['rc'] == 100.0 and metrics['re'] == 100.0
+    assert metrics['tcp_micro'] == 100.0

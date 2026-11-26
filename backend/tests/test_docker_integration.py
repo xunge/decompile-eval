@@ -186,3 +186,24 @@ def test_real_diagnostic_cpp_cases_have_no_fabricated_values():
     # C++ diagnostics keep pass/fail but do not invent typed values.
     assert out.cases[0]['actual_ok'] is False
     assert out.cases[0]['actual'] == ''
+
+
+def test_source_compiles_but_harness_type_mismatch_is_rc_success():
+    # Candidate function compiles alone (official RC=1); the harness passes a
+    # string to an int parameter, so the combined compile fails (RE=0).
+    src = 'int func0(int x) { return x; }'
+    tests = [{'name': 'upstream_harness',
+              'program': 'int main(void){ return func0("bad"); }'}]
+    out = evaluate_code(src, '', tests)
+    assert out.source_compile_success is True
+    assert out.compile_success is False
+    assert out.status == 'COMPILE_ERROR'
+    assert out.compile_stage == 'harness'
+
+
+def test_source_syntax_error_is_source_stage_failure():
+    out = evaluate_code('int func0( {', '', [
+        {'name': 'upstream_harness', 'program': 'int main(void){return 0;}'}])
+    assert out.source_compile_success is False
+    assert out.compile_success is False
+    assert out.compile_stage == 'source'

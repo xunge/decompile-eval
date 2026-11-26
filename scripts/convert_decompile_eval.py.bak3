@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""Convert HumanEval/MBPP or ExeBench test_real into DecompileEval-shaped JSONL.
+
+HumanEval/MBPP: executable `tests[0].program` (upstream harness).
+ExeBench: staging records containing `real_exe_wrapper` + independent I/O pairs.
+
+Compiler handling:
+  --compiler all (default) keeps the original dataset assembly.
+  --compiler gcc/clang selects genuine compiler-specific assembly. For HumanEval
+  and MBPP it recompiles from source (original Arrow has no compiler column).
+  For ExeBench GCC uses archived targets, while Clang recompiles from source.
+  --regenerate recompiles both with GCC/Clang when --compiler=all, using
+  the exact same host architecture and optimization flags for comparison.
+  Recompiled output is NOT the official dataset assembly and is labeled.
+  IMPORTANT: these are NOT directly executable by the HumanEval/MBPP sandbox;
+  an ExeBench-specific wrapper runner + reference oracle validation is needed
+  before reporting RC/RE/TCP. ExeBench output intentionally has no fake `tests`.
+"""
+import argparse
+from collections import Counter
+import hashlib
+from functools import lru_cache
+import io
+import json
+import platform
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+
+
+OPTS = ('O0', 'O1', 'O2', 'O3', 'Os', 'Ofast')
+
+
+def asm_text(raw):
+    text = str(raw or '').strip()
+    before = '# This is the assembly code:'
+    after = '# What is the source code?'
+    if before in text and after in text:
+        text = text.split(before, 1)[1].split(after, 1)[0].strip()
+    return text
+
+
+def get_opt(x):
+    opt = str(x or 'O0').strip().upper().lstrip('-')
+    if opt not in ('O0', 'O1', 'O2', 'O3', 'OS', 'OFAST'):
+        return None
+    return {'OS': 'Os', 'OFAST': 'Ofast'}.get(opt, opt)
+
+
+def convert_row(row, subset, pos, include_cpp=False):
+    """Existing HumanEval/MBPP format; kept backward compatible."""
+    lang = str(row.get('language') or 'c').strip().lower()
+    if lang in ('c++', 'cc', 'cxx'):
+        lang = 'cpp'
+    if lang not in ('c', 'cpp') or (lang == 'cpp' and not include_cpp):
+        return None, 'unsupported_language'
+    opt = get_opt(row.get('opt'))
+    asm = asm_text(row.get('asm'))
+    src = str(row.get('func') or '')
+    test = str(row.get('test') or '').strip()
+    deps = str(row.get('func_dep') or '')
+    if not opt or not asm or not src or not test:
+        return None, 'missing_opt_asm_source_or_harness'
+    idx = row.get('index', pos)
+    item = {
+        'sample_id': f'{subset}_{idx}_{opt}',
+        'problem_id': f'{subset}_{idx}',
+        'compiler': 'unspecified',
+        'optimization': opt,
+        'architecture': 'x86_64',
+        'language': lang,
+        'assembly': asm,
+        'reference_source': src,
+        'dependencies': deps,
+        'tests': [{'name': 'upstream_harness', 'program': test}],
+    }
+    return item, None
+
+
+def iter_exebench_rows(archive_path):
+    """Stream ExeBench TAR.GZ -> JSONL.ZST -> original raw records."""
+    try:
+        import zstandard as zstd
+    except ImportError:
+        zstd = None
+
+    with tarfile.open(archive_path, mode='r:gz') as tar:
+        members = sorted((m for m in tar if m.isfile() and m.name.endswith('.jsonl.zst')),
+                         key=lambda m: m.name)
+        if not members:
+            raise ValueError('No *.jsonl.zst found in ExeBench archive')
+        for member in members:
+            f = tar.extractfile(member)
+            if f is None:
+                continue
+            if zstd is not None:
+                with zstd.ZstdDecompressor().stream_reader(f) as stream:
+                    text = io.TextIOWrapper(stream, encoding='utf-8')
+                    for lineno, line in enumerate(text, 1):
+                        if not line.strip():
+                            continue
+                        record = json.loads(line)
+                        row = record.get('text', record) if isinstance(record, dict) else record
+                        if isinstance(row, dict):
+                            yield row, member.name, lineno
+                continue
+            # Fallback for environments without the optional wheel: stream via
+            # the system zstd CLI, still line-by-line.
+            tool = shutil.which('zstd')
+            if not tool:
+                raise SystemExit('ExeBench requires zstandard or the zstd CLI')
+            with tempfile.NamedTemporaryFile(suffix='.jsonl.zst', delete=False) as tmp:
+                shutil.copyfileobj(f, tmp)
+                tmp_path = Path(tmp.name)
+            try:
+                proc = subprocess.Popen([tool, '-dc', str(tmp_path)], stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True)
+                assert proc.stdout is not None
+                for lineno, line in enumerate(proc.stdout, 1):
+                    if not line.strip():
+                        continue
+                    record = json.loads(line)
+                    row = record.get('text', record) if isinstance(record, dict) else record
+                    if isinstance(row, dict):
+                        yield row, member.name, lineno
+                proc.wait()
+            finally:
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+
+def iter_asm_variants(raw):
+    """Handle official raw asm map AND transformed HF-style array."""
+    if isinstance(raw, dict):
+        for target, data in raw.items():
+            if isinstance(data, dict):
+                code = data.get('func_asm') or data.get('code') or ''
+            else:
+                code = data or ''
+            if isinstance(code, dict):
+                code = code.get('func_asm') or code.get('code') or ''
+            yield str(target), asm_text(code)
+    elif isinstance(raw, list):
+        for data in raw:
+            if not isinstance(data, dict):
+                continue
+            code = data.get('code') or data.get('func_asm') or ''
+            if isinstance(code, dict):
+                code = code.get('func_asm') or code.get('code') or ''
+            yield str(data.get('target') or ''), asm_text(code)
+
+
+def target_opt(target):
+    match = re.search(r'(?i)(?:^|[_-])(o0|o1|o2|o3|os|ofast)(?=$|[_-])', target)
+    return get_opt(match.group(1)) if match else None
+
+
+def target_compiler(target):
+    match = re.search(r'(?i)(?:^|[_-])(gcc|clang)(?=$|[_-])', target)
+    return match.group(1).lower() if match else 'unspecified'
+
+
+def target_arch(target):
+    value = target.lower()
+    if 'x86_64' in value or 'amd64' in value:
+        return 'x86_64'
+    if 'aarch64' in value or 'arm64' in value:
+        return 'aarch64'
+    if re.search(r'(?:^|[_-])x86(?=$|[_-])', value):
+        return 'x86'  # Do not assume that label means x86-64.
+    if 'mips' in value:
+        return 'mips'
+    if 'arm' in value:
+        return 'arm'
+    return 'unspecified'
+
+
+def normalize_io(value):
+    """Preserve typed raw ExeBench inputs/outputs; support HF flattened form."""
+    if isinstance(value, dict) and 'var' in value and 'value' in value:
+        keys, vals = value['var'], value['value']
+        if isinstance(keys, list) and isinstance(vals, list) and len(keys) == len(vals):
+            return {str(k): decode_json(v) for k, v in zip(keys, vals)}
+    if isinstance(value, list) and all(isinstance(x, dict) and 'var' in x for x in value):
+        return {str(x['var']): decode_json(x.get('value')) for x in value}
+    return value if value is not None else {}
+
+
+def decode_json(x):
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except (ValueError, TypeError):
+            return x
+    return x
+
+
+def exebench_record(row, pos, target, code, member, lineno):
+    opt = target_opt(target)
+    if not opt:
+        return None, 'unknown_optimization'
+    if not code.strip():
+        return None, 'empty_assembly'
+    source = row.get('func_def') or ''
+    wrapper = row.get('real_exe_wrapper') or ''
+    if not source:
+        return None, 'missing_reference_source'
+    if not wrapper:
+        return None, 'missing_real_exe_wrapper'
+
+    raw_pairs = row.get('real_io_pairs') or []
+    cases = []
+    for i, pair in enumerate(raw_pairs):
+        if not isinstance(pair, dict):
+            continue
+        cases.append({
+            'name': f'test_{i}',
+            'case_id': i,
+            'input': normalize_io(pair.get('input')),
+            'expected_output': normalize_io(pair.get('output')),
+            'dummy_funcs': pair.get('dummy_funcs') or '',
+            'dummy_funcs_seed': pair.get('dummy_funcs_seed'),
+        })
+    clean_target = re.sub(r'[^A-Za-z0-9_-]+', '_', target)[:60]
+    target_hash = hashlib.sha256(target.encode('utf-8')).hexdigest()[:8]
+    pid = f'exebench_test_real_{pos:06d}'
+    obj = {
+        'sample_id': f'{pid}_{clean_target}_{target_hash}',
+        'problem_id': pid,
+        'dataset': 'ExeBench-v1.01-test_real',
+        'compiler': target_compiler(target),
+        'optimization': opt,
+        'architecture': target_arch(target),
+        'language': 'c',
+        'assembly': code,
+        'reference_source': source,
+        'dependencies': row.get('real_deps') or '',
+        'function_name': row.get('fname') or '',
+        'function_signature': row.get('func_head_types') or row.get('func_head') or '',
+        'assembly_target': target,
+        'test_wrapper': wrapper,
+        'real_exe_wrapper': wrapper,          # legacy compatibility
+        'real_iospec': row.get('real_iospec') or {},
+        'tests': cases,
+        'testcases': cases,                    # legacy compatibility
+        'testcase_count': len(cases),
+        'test_protocol': 'exebench_io',
+        'oracle_validated': False,
+        'metadata': {
+            'source_path': row.get('path') or '',
+            'source_ref': row.get('ref') or '',
+            'signature': row.get('signature'),
+            'func_head': row.get('func_head') or '',
+            'angha_deps': row.get('angha_deps') or '',
+            'real_error': row.get('real_error'),
+            'real_io_pairs_are_trivial': row.get('real_io_pairs_are_trivial'),
+            'assembly_target': target,
+            'origin': {'archive_member': member, 'line': lineno},
+        },
+        'source_path': row.get('path') or '',
+        'source_ref': row.get('ref') or '',
+        'origin': {'archive_member': member, 'line': lineno},
+    }
+    return obj, None
+
+
+# ---------------------------------------------------------------------------
+# Compiler-aware assembly regeneration
+# ---------------------------------------------------------------------------
+
+FUNC_PATTERN = re.compile(
+    r"(?P<name>[A-Za-z_][A-Za-z_0-9:]*)\s*\([^;{}]*\)\s*"
+    r"(?:__attribute__\s*\(\([^{}]*\)\)\s*)?\{",
+    re.DOTALL,
+)
+OBJDUMP_HEADER = re.compile(r'^\s*[0-9a-fA-F]+\s+<([^>]+)>:$')
+
+
+def source_function_name(source, supplied=''):
+    if supplied and str(supplied).strip():
+        return str(supplied).strip()
+    for match in FUNC_PATTERN.finditer(source):
+        name = match.group('name')
+        if name not in {'if', 'for', 'while', 'switch', 'catch'}:
+            return name
+    return ''
+
+
+def compiler_path(family, args):
+    override = args.gcc if family == 'gcc' else args.clang
+    exe = shutil.which(override) if not Path(override).is_file() else override
+    if not exe:
+        raise SystemExit(f'Compiler {override!r} not found; install GCC/Clang or use --{family} /path/to/binary')
+    return str(Path(exe).resolve())
+
+
+@lru_cache(maxsize=8)
+def compiler_version(exe):
+    run = subprocess.run([exe, '--version'], capture_output=True, text=True, timeout=10)
+    return (run.stdout or run.stderr).splitlines()[0] if run.returncode == 0 else 'unknown'
+
+
+def target_arch_native():
+    machine = platform.machine().lower()
+    return {'amd64': 'x86_64', 'x86_64': 'x86_64', 'arm64': 'aarch64',
+            'aarch64': 'aarch64'}.get(machine, machine)
+
+
+@lru_cache(maxsize=4096)
+def demangle(symbol):
+    tool = shutil.which('c++filt')
+    if not tool:
+        return symbol
+    result = subprocess.run([tool, symbol], capture_output=True, text=True, timeout=5)
+    return result.stdout.strip() if result.returncode == 0 else symbol
+
+
+def symbol_match(name, expected):
+    if not name or not expected:
+        return False
+    left = name.split('(')[0].strip()
+    right = expected.split('(')[0].strip()
+    return (left == right or left.split('::')[-1] == right.split('::')[-1])
+
+
+def extract_function_asm(disassembly, expected):
+    """Extract one symbol, never silently return unrelated helper-function asm."""
+    functions = []
+    current = None
+    for line in disassembly.splitlines():
+        m = OBJDUMP_HEADER.match(line)
+        if m:
+            if current:
+                functions.append(current)
+            current = [m.group(1), []]
+        elif current and line.strip():
+            current[1].append(line)
+    if current:
+        functions.append(current)
+    if not functions:
+        raise ValueError('No function symbols found in compiled object')
+
+    matched = [f for f in functions if symbol_match(demangle(f[0]), expected)]
+    if len(matched) != 1:
+        if not expected and len(functions) == 1:
+            matched = functions
+        else:
+            raise ValueError(f'Unable to uniquely locate function {expected!r}: '
+                             f'found {len(matched)} matches; functions={[x[0] for x in functions][:15]}')
+    symbol, lines = matched[0]
+    if not lines:
+        raise ValueError(f'No disassembled instructions for {symbol}')
+    return symbol + ':\n' + '\n'.join(lines)
+
+
+def compile_function_assembly(src, deps, supplied_name, lang, family, opt, args):
+    """Compile source in a temporary directory, extract only target function."""
+    exe = compiler_path(family, args)
+    if not src.strip():
+        raise ValueError('Empty source code')
+    source = (str(deps or '') + '\n' + str(src or '') + '\n')
+    expected = source_function_name(src, supplied_name)
+    suffix = '.cc' if lang == 'cpp' else '.c'
+    flags = [f'-{opt}', '-c', '-fno-pie', '-fno-stack-protector']
+    with tempfile.TemporaryDirectory(prefix='decomp-asm-') as tmp:
+        path = Path(tmp) / ('candidate' + suffix)
+        obj = Path(tmp) / 'candidate.o'
+        path.write_text(source, encoding='utf-8')
+        cmd = [exe, *flags, str(path), '-o', str(obj)]
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                timeout=args.compile_timeout)
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout).strip()[-1500:]
+            raise ValueError(f'{family} -{opt} compile failed (exit {result.returncode}): {msg}')
+        dis = subprocess.run(['objdump', '-dr', '-M', 'att', '--no-show-raw-insn', str(obj)],
+                             capture_output=True, text=True, timeout=15)
+        if dis.returncode != 0:
+            raise ValueError(f'objdump failed: {dis.stderr[-500:]}')
+        asm = extract_function_asm(dis.stdout, expected)
+    return asm, {'compiler': family, 'compiler_version': compiler_version(exe),
+                 'assembly_origin': 'recompiled_objdump', 'assembly_syntax': 'att', 'compile_flags': flags,
+                 'architecture': target_arch_native(), 'source_function_name': expected}
+
+
+def write_failure(writer, sample_id, compiler, opt, error):
+    if writer is not None:
+        writer.write(json.dumps({'sample_id': sample_id, 'compiler': compiler,
+                                 'optimization': opt, 'error': str(error)}, ensure_ascii=False) + '\n')
+
+
+def convert_arrow(args, output):
+    filename = Path(args.raw) / args.subset / 'data-00000-of-00001.arrow'
+    if not filename.is_file():
+        raise SystemExit(f'Missing {filename}; run scripts/download_benchmarks.py first')
+    try:
+        from datasets import Dataset
+    except ImportError as exc:
+        raise SystemExit('HumanEval/MBPP requires: python -m pip install datasets pyarrow') from exc
+    dataset = Dataset.from_file(str(filename))
+    # Original Arrow does not expose compiler provenance. Never just relabel it.
+    regenerate = args.regenerate or args.compiler != 'all'
+    if regenerate:
+        families = ('gcc', 'clang') if args.compiler == 'all' else (args.compiler,)
+        for family in families:
+            compiler_path(family, args)
+        if not shutil.which('objdump'):
+            raise SystemExit('objdump is required for recompilation (install binutils)')
+    else:
+        families = ()
+        print('NOTE: original HumanEval/MBPP asm has no compiler field: compiler=unspecified. '
+              'Use --compiler gcc or clang to recompile it.')
+
+    kept, skipped, seen = 0, Counter(), set()
+    failure_file = output.with_suffix('.failures.jsonl') if regenerate else None
+    from contextlib import nullcontext
+    failures = failure_file.open('w', encoding='utf-8') if failure_file else nullcontext(None)
+    with output.open('w', encoding='utf-8') as writer, failures as error_writer:
+        for pos, row in enumerate(dataset):
+            obj, reason = convert_row(row, args.subset, pos, args.include_cpp)
+            if reason:
+                skipped[reason] += 1
+                continue
+            if args.opt != 'all' and obj['optimization'] != args.opt:
+                continue
+            if regenerate:
+                candidates = []
+                for family in families:
+                    key = f'{obj["sample_id"]}_{family}'
+                    try:
+                        asm, meta = compile_function_assembly(
+                            obj['reference_source'], obj['dependencies'],
+                            row.get('func_name') or '', obj['language'],
+                            family, obj['optimization'], args)
+                    except (ValueError, subprocess.TimeoutExpired) as exc:
+                        skipped[f'{family}_compile_or_extract_failed'] += 1
+                        write_failure(error_writer, key, family, obj['optimization'], exc)
+                        continue
+                    record = dict(obj)
+                    record.update(meta)
+                    record['sample_id'] = f'{args.subset}_{row.get("index", pos)}_{family}_{obj["optimization"]}'
+                    record['assembly'] = asm
+                    record['reference_assembly'] = obj['assembly']
+                    candidates.append(record)
+            else:
+                candidates = [obj]
+            for record in candidates:
+                if record['sample_id'] in seen:
+                    raise ValueError(f'Duplicate sample_id: {record["sample_id"]}')
+                seen.add(record['sample_id'])
+                writer.write(json.dumps(record, ensure_ascii=False) + '\n')
+                kept += 1
+                if args.max_samples and kept >= args.max_samples:
+                    break
+            if args.max_samples and kept >= args.max_samples:
+                break
+    print(f'{args.subset}: saved {kept} -> {output} ({output.stat().st_size/1048576:.2f} MiB)')
+    print('Skipped:', dict(skipped))
+    if regenerate:
+        print(f'Recompilation failure details: {failure_file}')
+        print('IMPORTANT: regenerated assembly is not the original public benchmark input.')
+    print('NOTE: validate reference code before reporting metrics.')
+
+
+def build_exebench_regenerated(row, pos, compiler, opt, member, lineno, args):
+    source = str(row.get('func_def') or '')
+    deps = str(row.get('real_deps') or '')
+    asm, meta = compile_function_assembly(
+        source, deps, row.get('fname') or '', 'c', compiler, opt, args)
+    target = f'recompiled_{compiler}_{meta["architecture"]}_{opt}'
+    obj, reason = exebench_record(row, pos, target, asm, member, lineno)
+    if reason:
+        raise ValueError(reason)
+    obj.update(meta)
+    obj['assembly_target'] = target
+    obj['original_asm_targets'] = [target for target, _ in iter_asm_variants(row.get('asm'))]
+    return obj
+
+
+def convert_exebench(args, output):
+    archive = Path(args.archive)
+    if not archive.is_file():
+        raise SystemExit(f'Missing ExeBench archive: {archive}; download test_real.tar.gz first')
+    # Official raw ExeBench is GCC. Clang needs recompilation. --regenerate
+    # also allows controlled GCC-vs-Clang experiments on the same host.
+    regenerate = args.regenerate or args.compiler == 'clang'
+    if regenerate:
+        families = ('gcc', 'clang') if args.compiler == 'all' else (args.compiler,)
+        for family in families:
+            compiler_path(family, args)
+        if not shutil.which('objdump'):
+            raise SystemExit('objdump is required for recompilation (install binutils)')
+    else:
+        families = ()
+    kept, skipped, targets, seen = 0, Counter(), Counter(), set()
+    failure_file = output.with_suffix('.failures.jsonl') if regenerate else None
+    from contextlib import nullcontext
+    failures = failure_file.open('w', encoding='utf-8') if failure_file else nullcontext(None)
+    with output.open('w', encoding='utf-8') as writer, failures as error_writer:
+        for pos, (row, member, lineno) in enumerate(iter_exebench_rows(archive)):
+            skipped['source_functions_seen'] += 1
+            if regenerate:
+                opts = (('O0', 'O1', 'O2', 'O3') if args.opt == 'all' else (args.opt,))
+                candidates = []
+                for family in families:
+                    for opt in opts:
+                        key = f'exebench_test_real_{pos:06d}_{family}_{opt}'
+                        try:
+                            obj = build_exebench_regenerated(row, pos, family, opt, member, lineno, args)
+                        except (ValueError, subprocess.TimeoutExpired) as exc:
+                            skipped[f'{family}_compile_or_extract_failed'] += 1
+                            write_failure(error_writer, key, family, opt, exc)
+                            continue
+                        candidates.append(obj)
+            else:
+                candidates = []
+                for target, code in iter_asm_variants(row.get('asm')):
+                    targets[target] += 1
+                    if args.compiler != 'all' and target_compiler(target) != args.compiler:
+                        continue
+                    if args.opt != 'all' and target_opt(target) != args.opt:
+                        continue
+                    obj, reason = exebench_record(row, pos, target, code, member, lineno)
+                    if reason:
+                        skipped[reason] += 1
+                        continue
+                    obj['assembly_origin'] = 'official_exebench'
+                    candidates.append(obj)
+            for obj in candidates:
+                if args.target_contains and args.target_contains.lower() not in obj['assembly_target'].lower():
+                    continue
+                if len(obj['testcases']) < args.min_io:
+                    skipped['too_few_io_pairs'] += 1
+                    continue
+                if obj['sample_id'] in seen:
+                    raise ValueError(f'Duplicate sample_id: {obj["sample_id"]}')
+                seen.add(obj['sample_id'])
+                writer.write(json.dumps(obj, ensure_ascii=False) + '\n')
+                kept += 1
+                if args.max_samples and kept >= args.max_samples:
+                    break
+            if args.max_samples and kept >= args.max_samples:
+                break
+    print(f'exebench: saved {kept} assembly variants -> {output} ({output.stat().st_size/1048576:.2f} MiB)')
+    print('Skipped:', dict(skipped))
+    if regenerate:
+        print(f'Recompilation failure details: {failure_file}')
+        print('IMPORTANT: regenerated assembly is NOT official ExeBench assembly.')
+    else:
+        print('Available native targets:', targets.most_common(12))
+    print('ExeBench output is directly importable (test_protocol=exebench_io).')
+    print('Run the dataset Oracle validation before trusting metrics.')
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument('--raw', default='data/raw/llm4binary-decompile-eval', help='HumanEval/MBPP Arrow root')
+    p.add_argument('--subset', choices=['humaneval', 'mbpp', 'exebench'], required=True)
+    p.add_argument('--archive', default='data/raw/jordiae-exebench-v1.01/test_real.tar.gz',
+                   help='ExeBench test_real archive')
+    p.add_argument('--out', help='Output JSONL path; ExeBench defaults to data/staging/')
+    p.add_argument('--max-samples', type=int, default=0, help='0 = all; counts compiled variants')
+    p.add_argument('--include-cpp', action='store_true', help='HumanEval/MBPP only')
+    p.add_argument('--opt', choices=['all', *OPTS], default='all')
+    p.add_argument('--compiler', choices=['all', 'gcc', 'clang'], default='all',
+                   help='Explicit gcc/clang regenerates asm for Arrow; clang regenerates for ExeBench')
+    p.add_argument('--regenerate', action='store_true',
+                   help='Recompile source. With --compiler all, generate GCC AND Clang asm')
+    p.add_argument('--gcc', default='gcc', help='GCC compiler executable')
+    p.add_argument('--clang', default='clang', help='Clang compiler executable')
+    p.add_argument('--compile-timeout', type=int, default=30, help='Recompile timeout (seconds per sample)')
+    p.add_argument('--target-contains', default='', help='ExeBench assembly target name filter')
+    p.add_argument('--min-io', type=int, default=1, help='ExeBench minimum I/O cases')
+    args = p.parse_args()
+    if args.max_samples < 0 or args.min_io < 0 or args.compile_timeout <= 0:
+        p.error('--max-samples, --min-io must be nonnegative; --compile-timeout > 0')
+    if args.out:
+        output = Path(args.out)
+    elif args.subset == 'exebench':
+        suffix = f'_{args.compiler}' if args.compiler != 'all' or args.regenerate else ''
+        # Default output is directly importable; use --out to override.
+        output = Path('data/import') / f'exebench{suffix}_{args.opt}.jsonl'
+    else:
+        suffix = f'_{args.compiler}' if args.compiler != 'all' or args.regenerate else ''
+        output = Path('data/import') / f'{args.subset}{suffix}_{args.opt}.jsonl'
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if args.subset == 'exebench':
+        convert_exebench(args, output)
+    else:
+        convert_arrow(args, output)
+
+
+if __name__ == '__main__':
+    main()

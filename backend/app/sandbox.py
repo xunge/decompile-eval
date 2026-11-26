@@ -57,6 +57,8 @@ class EvalOutcome:
     cases: list[dict] = field(default_factory=list)
     diagnostic_status: str = ''
     case_coverage: dict = field(default_factory=dict)
+    source_compile_success: bool | None = None
+    compile_stage: str = ''
 
     def detail(self) -> str:
         """Structured payload persisted in results.detail_json."""
@@ -64,6 +66,8 @@ class EvalOutcome:
             'harness_mode': self.harness_mode,
             'harness_note': self.harness_note,
             'failure_reason': self.failure_reason,
+            'compile_stage': self.compile_stage,
+            'source_compile_ok': self.source_compile_success,
             'compile': {
                 'exit_code': self.compile_exit_code,
                 'signal': self.compile_signal,
@@ -270,12 +274,40 @@ def main():
     std = "-std=c++17" if language == "cpp" else "-std=c11"
     compiler_cmd = [compiler, std, "-O0", "-w", source, "-o", "/work/program", "-lm"]
 
+    # Official LLM4Decompile compile-rate: compile the generated function
+    # alone (include headers + candidate), not candidate + test harness.
+    # The paper-era GCC accepted implicit declarations and pointer-conversion
+    # warnings; GCC 14 promotes them to errors.  gnu11 + explicit downgrades
+    # keep the compile-rate comparison as close to the paper as possible.
+    only_source = "/input/program_only.cpp" if language == "cpp" else "/input/program_only.c"
+    only_std = "-std=gnu++17" if language == "cpp" else "-std=gnu11"
+    compat = [] if language == "cpp" else [
+        "-D_GNU_SOURCE",
+        "-Wno-error=implicit-function-declaration",
+        "-Wno-error=incompatible-pointer-types",
+        "-Wno-error=int-conversion",
+    ]
+    source_cmd = [compiler, only_std, *compat, "-O0", "-S", only_source,
+                  "-o", "/work/program_only.s", "-lm"]
+    source_result = run(source_cmd, compile_timeout,
+                        "/work/source_compile.out", "/work/source_compile.err")
+    event("source_compile", source_result, "/work/source_compile.out",
+          "/work/source_compile.err", limit)
+    source_compiled = not (source_result.get("spawn_error")
+                           or source_result.get("timed_out")
+                           or source_result.get("returncode") != 0)
+    if not source_compiled:
+        emit({"type": "done", "tests": 0, "compiled": False,
+              "source_compiled": False, "diag": diagnostic})
+        return
+
     result = run(compiler_cmd, compile_timeout, "/work/compile.out", "/work/compile.err")
     event("compile", result, "/work/compile.out", "/work/compile.err", limit)
     compiled = not (result.get("spawn_error") or result.get("timed_out")
                     or result.get("returncode") != 0)
     if not compiled:
-        emit({"type": "done", "tests": 0, "compiled": False, "diag": diagnostic})
+        emit({"type": "done", "tests": 0, "compiled": False,
+              "source_compiled": True, "diag": diagnostic})
         return
 
     for index in range(total):
@@ -425,7 +457,8 @@ def parse_events(raw: str) -> tuple[list[dict], list[str]]:
                 noise.append(line)
                 continue
             if isinstance(obj, dict) and obj.get('type') in (
-                    'compile', 'test', 'done', 'case', 'diag_compile', 'diag_done'):
+                    'compile', 'source_compile', 'test', 'done', 'case',
+                    'diag_compile', 'diag_done'):
                 events.append(obj)
                 continue
         noise.append(line)
@@ -439,57 +472,135 @@ def _compile_event(events: list[dict]) -> dict | None:
     return None
 
 
+def _source_compile_event(events: list[dict]) -> dict | None:
+    for ev in reversed(events):
+        if ev.get('type') == 'source_compile':
+            return ev
+    return None
+
+
+def _compile_fields(ev: dict) -> dict:
+    return {
+        'duration_ms': int(ev.get('duration_ms') or 0),
+        'exit_code': ev.get('exit_code'),
+        'signal': ev.get('signal'),
+        'timed_out': bool(ev.get('timed_out')),
+        'stdout': str(ev.get('stdout') or ''),
+        'stderr': str(ev.get('stderr') or ''),
+        'spawn_error': ev.get('spawn_error'),
+    }
+
+
+def _compiler_log(ev: dict) -> str:
+    return _capped(
+        ('--- compiler stdout ---\n' + _stream(ev, 'stdout') + '\n'
+         '--- compiler stderr ---\n' + _stream(ev, 'stderr')), 20000)
+
+
 def outcome_from_events(events: list[dict], total_tests: int, mode: str,
                         raw_noise: str = '', stderr_text: str = '',
                         log_limit: int = 5000) -> EvalOutcome:
-    """Pure classification of structured runner events (also used by unit tests)."""
-    compile_ev = _compile_event(events)
+    """Pure classification of structured runner events (also used by unit tests).
+
+    RC follows the official LLM4Decompile protocol: a candidate is counted as
+    compiled when ``c_include + c_func_decompile`` compiles by itself.  The
+    combined candidate+harness compile is tracked separately as
+    ``compile_success`` and gates RE/TCP.
+    """
     note = HARNESS_NOTE_PROGRAM if mode == 'program' else ''
+    source_ev = _source_compile_event(events)
+    source_ok = None
+    source_log = ''
+
+    # Stage 1, official RC: candidate function alone.
+    if source_ev is not None:
+        src = _compile_fields(source_ev)
+        source_log = _compiler_log(source_ev)
+        if src['spawn_error']:
+            return EvalOutcome(
+                'INFRA_ERROR', None, 0, total_tests,
+                compile_log=source_log,
+                error=f'Compiler could not start (source stage): {src["spawn_error"]}',
+                compile_ms=src['duration_ms'], compile_stdout=src['stdout'],
+                compile_stderr=src['stderr'], compile_exit_code=src['exit_code'],
+                compile_signal=src['signal'], compile_timed_out=src['timed_out'],
+                harness_mode=mode, harness_note=note,
+                source_compile_success=None, compile_stage='source')
+        if src['timed_out']:
+            return EvalOutcome(
+                'COMPILE_TIMEOUT', False, 0, total_tests,
+                compile_log=source_log,
+                error='Candidate-only compilation timed out.',
+                compile_ms=src['duration_ms'], compile_stdout=src['stdout'],
+                compile_stderr=src['stderr'], compile_exit_code=src['exit_code'],
+                compile_signal=src['signal'], compile_timed_out=True,
+                harness_mode=mode, harness_note=note,
+                source_compile_success=False, compile_stage='source')
+        if src['exit_code'] not in (0, None) or src['signal']:
+            return EvalOutcome(
+                'COMPILE_ERROR', False, 0, total_tests,
+                compile_log=source_log,
+                error='Candidate-only compilation failed.',
+                compile_ms=src['duration_ms'], compile_stdout=src['stdout'],
+                compile_stderr=src['stderr'], compile_exit_code=src['exit_code'],
+                compile_signal=src['signal'], compile_timed_out=False,
+                harness_mode=mode, harness_note=note,
+                source_compile_success=False, compile_stage='source')
+        source_ok = True
+
+    # Stage 2, full harness compile + execution for RE/TCP.
+    compile_ev = _compile_event(events)
     if compile_ev is None:
         return EvalOutcome(
             'INFRA_ERROR', None, 0, total_tests,
-            run_log=_capped(raw_noise, 4000), error='Sandbox produced no compile event.',
-            harness_mode=mode, harness_note=note)
-    compile_ms = int(compile_ev.get('duration_ms') or 0)
-    compile_exit = compile_ev.get('exit_code')
-    compile_signal = compile_ev.get('signal')
-    compile_timed_out = bool(compile_ev.get('timed_out'))
-    compile_stdout = str(compile_ev.get('stdout') or '')
-    compile_stderr = str(compile_ev.get('stderr') or '')
-    compile_log = _capped(
-        ('--- compiler stdout ---\n' + _stream(compile_ev, 'stdout') + '\n'
-         '--- compiler stderr ---\n' + _stream(compile_ev, 'stderr')), 20000)
-    if compile_ev.get('spawn_error'):
-        return EvalOutcome('INFRA_ERROR', None, 0, total_tests,
-                           compile_log=compile_log, error=f'Compiler could not start: {compile_ev["spawn_error"]}',
-                           compile_ms=compile_ms, compile_stdout=compile_stdout,
-                           compile_stderr=compile_stderr, compile_exit_code=compile_exit,
-                           compile_signal=compile_signal, compile_timed_out=compile_timed_out,
-                           harness_mode=mode, harness_note=note)
-    if compile_timed_out:
-        return EvalOutcome('COMPILE_TIMEOUT', False, 0, total_tests,
-                           compile_log=compile_log, error='Compilation timed out.',
-                           compile_ms=compile_ms, compile_stdout=compile_stdout,
-                           compile_stderr=compile_stderr, compile_exit_code=compile_exit,
-                           compile_signal=compile_signal, compile_timed_out=compile_timed_out,
-                           harness_mode=mode, harness_note=note)
-    if compile_ev.get('exit_code') not in (0, None) or compile_ev.get('signal'):
-        return EvalOutcome('COMPILE_ERROR', False, 0, total_tests,
-                           compile_log=compile_log, error='Compilation failed.',
-                           compile_ms=compile_ms, compile_stdout=compile_stdout,
-                           compile_stderr=compile_stderr, compile_exit_code=compile_exit,
-                           compile_signal=compile_signal, compile_timed_out=compile_timed_out,
-                           harness_mode=mode, harness_note=note)
+            run_log=_capped(raw_noise, 4000),
+            error='Sandbox produced no harness compile event.',
+            harness_mode=mode, harness_note=note,
+            source_compile_success=source_ok, compile_stage='harness')
+    full = _compile_fields(compile_ev)
+    compile_log = _compiler_log(compile_ev)
+    stage = 'harness' if source_ev is not None else ''
+    if full['spawn_error']:
+        return EvalOutcome(
+            'INFRA_ERROR', None, 0, total_tests,
+            compile_log=compile_log,
+            error=f'Compiler could not start (harness stage): {full["spawn_error"]}',
+            compile_ms=full['duration_ms'], compile_stdout=full['stdout'],
+            compile_stderr=full['stderr'], compile_exit_code=full['exit_code'],
+            compile_signal=full['signal'], compile_timed_out=full['timed_out'],
+            harness_mode=mode, harness_note=note,
+            source_compile_success=source_ok, compile_stage=stage)
+    if full['timed_out']:
+        return EvalOutcome(
+            'COMPILE_TIMEOUT', False, 0, total_tests,
+            compile_log=compile_log, error='Harness compilation timed out.',
+            compile_ms=full['duration_ms'], compile_stdout=full['stdout'],
+            compile_stderr=full['stderr'], compile_exit_code=full['exit_code'],
+            compile_signal=full['signal'], compile_timed_out=True,
+            harness_mode=mode, harness_note=note,
+            source_compile_success=source_ok, compile_stage=stage)
+    if full['exit_code'] not in (0, None) or full['signal']:
+        return EvalOutcome(
+            'COMPILE_ERROR', False, 0, total_tests,
+            compile_log=compile_log, error='Harness compilation failed.',
+            compile_ms=full['duration_ms'], compile_stdout=full['stdout'],
+            compile_stderr=full['stderr'], compile_exit_code=full['exit_code'],
+            compile_signal=full['signal'], compile_timed_out=False,
+            harness_mode=mode, harness_note=note,
+            source_compile_success=source_ok, compile_stage=stage)
 
     test_events = {int(ev.get('index', 0)): ev for ev in events if ev.get('type') == 'test'}
     if set(test_events) != set(range(total_tests)):
-        return EvalOutcome('INFRA_ERROR', None, 0, total_tests,
-                           compile_log=compile_log, run_log=_capped(raw_noise, 4000),
-                           error='Missing testcase events; the sandbox probably stopped.',
-                           compile_ms=compile_ms, compile_stdout=compile_stdout,
-                           compile_stderr=compile_stderr, compile_exit_code=compile_exit,
-                           compile_signal=compile_signal, compile_timed_out=compile_timed_out,
-                           harness_mode=mode, harness_note=note)
+        return EvalOutcome(
+            'INFRA_ERROR', None, 0, total_tests,
+            compile_log=compile_log, run_log=_capped(raw_noise, 4000),
+            error='Missing testcase events; the sandbox probably stopped.',
+            compile_ms=full['duration_ms'], compile_stdout=full['stdout'],
+            compile_stderr=full['stderr'], compile_exit_code=full['exit_code'],
+            compile_signal=full['signal'], compile_timed_out=full['timed_out'],
+            harness_mode=mode, harness_note=note,
+            source_compile_success=source_ok,
+            compile_stage='ok' if source_ev is not None else '')
     records = [_test_record(test_events[i]) for i in range(total_tests)]
     passed = sum(r['status'] == 'PASS' for r in records)
     test_ms = sum(r['duration_ms'] for r in records)
@@ -513,16 +624,19 @@ def outcome_from_events(events: list[dict], total_tests: int, mode: str,
         coverage = {'executed': int(diag_done.get('cases') or 0),
                     'max_cases': int(diag_done.get('max_cases') or 0),
                     'failures': diag_done.get('failures') if isinstance(diag_done.get('failures'), list) else []}
-    return EvalOutcome(status, True, passed, total_tests,
-                       compile_log=compile_log, run_log=run_log, error=reason,
-                       compile_ms=compile_ms, test_ms=test_ms,
-                       compile_exit_code=compile_exit, compile_signal=compile_signal,
-                       compile_timed_out=compile_timed_out,
-                       compile_stdout=compile_stdout, compile_stderr=compile_stderr,
-                       tests=records, harness_mode=mode, harness_note=note,
-                       failure_reason=reason, cases=case_events,
-                       diagnostic_status=(diag_done or {}).get('status', ''),
-                       case_coverage=coverage)
+    return EvalOutcome(
+        status, True, passed, total_tests,
+        compile_log=compile_log, run_log=run_log, error=reason,
+        compile_ms=full['duration_ms'], test_ms=test_ms,
+        compile_exit_code=full['exit_code'], compile_signal=full['signal'],
+        compile_timed_out=full['timed_out'],
+        compile_stdout=full['stdout'], compile_stderr=full['stderr'],
+        tests=records, harness_mode=mode, harness_note=note,
+        failure_reason=reason, cases=case_events,
+        diagnostic_status=(diag_done or {}).get('status', ''),
+        case_coverage=coverage,
+        source_compile_success=source_ok,
+        compile_stage='ok' if source_ev is not None else '')
 
 
 def _format_run_log(records: list[dict], note: str, reason: str) -> str:
@@ -613,6 +727,17 @@ def _prepare_input(candidate: str, dependencies: str, tests: list[dict],
     source = build_c_file(candidate, dependencies, tests)
     src = path / ('program.cpp' if language == 'cpp' else 'program.c')
     src.write_text(source, encoding='utf-8')
+    only_src = path / ('program_only.cpp' if language == 'cpp' else 'program_only.c')
+    # Official c_include combines headers from the reference function and the
+    # test harness.  Add harness includes to the candidate-only source too.
+    harness_includes = []
+    for test in tests:
+        for text in (test.get('program') or '', test.get('code') or ''):
+            for line in text.splitlines():
+                if '#include' in line and line.strip() not in harness_includes:
+                    harness_includes.append(line.strip())
+    only_source = dependencies + '\n' + '\n'.join(harness_includes) + '\n' + candidate + '\n'
+    only_src.write_text(only_source, encoding='utf-8')
     (path / 'runner.py').write_text(RUNNER_SOURCE, encoding='utf-8')
     if diagnostic and diagnostic.get('harness'):
         harness = diagnostic['harness']
@@ -627,6 +752,7 @@ def _prepare_input(candidate: str, dependencies: str, tests: list[dict],
     # Read access for unprivileged uid=65534 inside a read-only bind mount.
     os.chmod(path, 0o755)
     os.chmod(src, 0o644)
+    os.chmod(only_src, 0o644)
     os.chmod(path / 'runner.py', 0o644)
     return path
 

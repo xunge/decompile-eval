@@ -36,3 +36,27 @@
 .case-table pre{max-height:150px;overflow:auto;white-space:pre-wrap;word-break:break-word;margin:4px 0;font-size:10px}
 .case-pager{display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:10px;font-size:11px;color:#6d7f92}
 .case-metrics{margin-top:-4px}
+
+/* --- deployments & GPU monitor --- */
+.gpu-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;margin:14px 0}
+.gpu-card{border:1px solid #e6edf5;border-radius:12px;padding:13px;background:#fff;box-shadow:0 1px 4px rgba(35,70,110,.05)}
+.gpu-head{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.gpu-head small{display:block;color:#8b9aab;font-size:10px;margin-top:2px}
+.gpu-bars{margin:10px 0 6px}
+.gpu-bars label{font-size:10px;color:#6d7f92;display:block;margin-bottom:4px}
+.gpu-stats{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:10px;color:#6d7f92;margin-top:6px}
+.gpu-stats b{color:#2a3f55}
+.gpu-sparks{display:grid;grid-template-columns:1fr 1fr;gap:6px 12px;margin:8px 0}
+.gpu-sparks span{font-size:9px;color:#8b9aab;display:block}
+.gpu-sparks svg{width:100%;height:38px;background:#f7fafd;border-radius:6px}
+.gpu-processes{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.gpu-processes .pill{font-size:9px}
+.deploy-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 12px}
+.deploy-grid label{margin:0}
+.deploy-grid input,.deploy-grid select{width:100%}
+@media (max-width:900px){.deploy-grid{grid-template-columns:1fr}}
+.deploy-log{max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:11px;background:#0f1b29;color:#dbe7f2;padding:14px;border-radius:9px}
+.exebench-io{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;margin:8px 0}
+.exebench-io b{font-size:10px;color:#7b8ea3}
+.exebench-io pre{margin:3px 0 0;background:#f5f8fb;border:1px solid #e6edf5;border-radius:6px;padding:7px;max-height:130px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:10px}
+@media(max-width:730px){.exebench-io{grid-template-columns:1fr}}

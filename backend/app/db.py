@@ -46,6 +46,20 @@ def initialize():
           assembly TEXT NOT NULL, reference_source TEXT NOT NULL,
           dependencies TEXT NOT NULL DEFAULT '', tests_json TEXT NOT NULL,
           demo_prediction TEXT NOT NULL DEFAULT '',
+          test_protocol TEXT NOT NULL DEFAULT '',
+          test_wrapper TEXT NOT NULL DEFAULT '',
+          real_iospec TEXT NOT NULL DEFAULT '',
+          function_name TEXT NOT NULL DEFAULT '',
+          function_signature TEXT NOT NULL DEFAULT '',
+          metadata_json TEXT NOT NULL DEFAULT '',
+          oracle_validated INTEGER NOT NULL DEFAULT 0,
+          oracle_test_count INTEGER NOT NULL DEFAULT 0,
+          oracle_passed_count INTEGER NOT NULL DEFAULT 0,
+          oracle_failed_count INTEGER NOT NULL DEFAULT 0,
+          oracle_error TEXT NOT NULL DEFAULT '',
+          oracle_detail_json TEXT NOT NULL DEFAULT '',
+          oracle_signature TEXT NOT NULL DEFAULT '',
+          oracle_checked_at TEXT NOT NULL DEFAULT '',
           UNIQUE(dataset_id, sample_key)
         );
         CREATE TABLE IF NOT EXISTS models (
@@ -68,6 +82,9 @@ def initialize():
           run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
           sample_id INTEGER NOT NULL REFERENCES samples(id),
           status TEXT NOT NULL, compile_success INTEGER,
+          source_compile_ok INTEGER,
+          compile_stage TEXT NOT NULL DEFAULT '',
+          edit_similarity REAL,
           tests_passed INTEGER NOT NULL DEFAULT 0,
           tests_total INTEGER NOT NULL DEFAULT 0,
           model_output TEXT NOT NULL DEFAULT '',
@@ -98,6 +115,62 @@ def initialize():
         CREATE INDEX IF NOT EXISTS idx_results_run ON results(run_id);
         CREATE INDEX IF NOT EXISTS idx_samples_ds ON samples(dataset_id);
         CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status);
+        CREATE TABLE IF NOT EXISTS deployments (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          name TEXT NOT NULL,
+          served_name TEXT NOT NULL,
+          model_path TEXT NOT NULL,
+          gpu_ids TEXT NOT NULL DEFAULT '0',
+          port INTEGER NOT NULL,
+          dtype TEXT NOT NULL DEFAULT 'auto',
+          max_model_len INTEGER NOT NULL,
+          max_num_seqs INTEGER NOT NULL,
+          max_num_batched_tokens INTEGER NOT NULL,
+          gpu_memory_utilization REAL NOT NULL,
+          api_mode TEXT NOT NULL DEFAULT 'completion',
+          managed INTEGER NOT NULL DEFAULT 1,
+          base_url TEXT NOT NULL DEFAULT '',
+          pid INTEGER,
+          pgid INTEGER,
+          status TEXT NOT NULL DEFAULT 'starting',
+          error TEXT NOT NULL DEFAULT '',
+          log_path TEXT NOT NULL DEFAULT '',
+          model_id INTEGER,
+          config_json TEXT NOT NULL DEFAULT '{}',
+          created_at TEXT NOT NULL,
+          started_at TEXT,
+          stopped_at TEXT,
+          last_check_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
+        CREATE TABLE IF NOT EXISTS gpu_samples (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          ts_epoch REAL NOT NULL,
+          gpu_index INTEGER NOT NULL,
+          gpu_uuid TEXT NOT NULL DEFAULT '',
+          name TEXT NOT NULL DEFAULT '',
+          utilization REAL,
+          memory_used_mb INTEGER,
+          memory_total_mb INTEGER,
+          temperature_c REAL,
+          power_w REAL,
+          power_limit_w REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_gpu_samples_ts ON gpu_samples(ts_epoch);
+        CREATE TABLE IF NOT EXISTS vllm_samples (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts TEXT NOT NULL,
+          ts_epoch REAL NOT NULL,
+          deployment_id INTEGER NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,
+          running INTEGER,
+          waiting INTEGER,
+          prompt_tokens_total REAL,
+          generation_tokens_total REAL,
+          input_tokens_per_sec REAL,
+          output_tokens_per_sec REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_vllm_samples_deploy ON vllm_samples(deployment_id,ts_epoch);
         CREATE TABLE IF NOT EXISTS case_manifests (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
@@ -146,6 +219,8 @@ def initialize():
         model_cols={r[1] for r in db.execute('PRAGMA table_info(models)')}
         if 'api_mode' not in model_cols:
             db.execute("ALTER TABLE models ADD COLUMN api_mode TEXT NOT NULL DEFAULT 'chat'")
+        _ensure_column(db, 'models', 'deployment_id', 'INTEGER')
+        db.execute('CREATE INDEX IF NOT EXISTS idx_models_deployment ON models(deployment_id)')
         # Automatic, additive migration for existing evaluation databases.
         _ensure_column(db, 'runs', 'started_at', 'TEXT')
         for column, ddl in (
@@ -170,6 +245,26 @@ def initialize():
             ('detail_json', "TEXT NOT NULL DEFAULT ''"),
         ):
             _ensure_column(db, 'results', column, ddl)
+        for column, ddl in (
+            ('test_protocol', "TEXT NOT NULL DEFAULT ''"),
+            ('test_wrapper', "TEXT NOT NULL DEFAULT ''"),
+            ('real_iospec', "TEXT NOT NULL DEFAULT ''"),
+            ('function_name', "TEXT NOT NULL DEFAULT ''"),
+            ('function_signature', "TEXT NOT NULL DEFAULT ''"),
+            ('metadata_json', "TEXT NOT NULL DEFAULT ''"),
+            ('oracle_validated', 'INTEGER NOT NULL DEFAULT 0'),
+            ('oracle_test_count', 'INTEGER NOT NULL DEFAULT 0'),
+            ('oracle_passed_count', 'INTEGER NOT NULL DEFAULT 0'),
+            ('oracle_failed_count', 'INTEGER NOT NULL DEFAULT 0'),
+            ('oracle_error', "TEXT NOT NULL DEFAULT ''"),
+            ('oracle_detail_json', "TEXT NOT NULL DEFAULT ''"),
+            ('oracle_signature', "TEXT NOT NULL DEFAULT ''"),
+            ('oracle_checked_at', "TEXT NOT NULL DEFAULT ''"),
+        ):
+            _ensure_column(db, 'samples', column, ddl)
+        _ensure_column(db, 'results', 'source_compile_ok', 'INTEGER')
+        _ensure_column(db, 'results', 'compile_stage', "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(db, 'results', 'edit_similarity', 'REAL')
         db.execute('CREATE INDEX IF NOT EXISTS idx_results_run_status ON results(run_id,status)')
         _ensure_column(db, 'runs', 'metric_version', "TEXT NOT NULL DEFAULT ''")
         _ensure_column(db, 'datasets', 'source_hash', "TEXT NOT NULL DEFAULT ''")

@@ -3,6 +3,18 @@ from pathlib import Path
 import os
 
 
+def _env_float(name: str, default: float, minimum: float = 0.0,
+               maximum: float = 1_000_000.0) -> float:
+    raw = os.getenv(name, '').strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
 def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 4096) -> int:
     raw = os.getenv(name, '').strip()
     if not raw:
@@ -19,8 +31,12 @@ DATA_DIR = Path(os.getenv('DEC_EVAL_DATA_DIR', str(ROOT / 'storage'))).resolve()
 DB_FILE = DATA_DIR / 'decompile_eval.sqlite3'
 SANDBOX_IMAGE = os.getenv('DEC_EVAL_SANDBOX_IMAGE', 'gcc:14')
 CORS_ORIGINS = os.getenv('DEC_EVAL_CORS_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(',')
-MAX_UPLOAD_BYTES = 64 * 1024 * 1024
-MAX_SAMPLES = 12000
+MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # offline predictions only
+# Dataset uploads are unlimited by default; set a byte cap only if the
+# operator explicitly wants one.  0 means no cap.
+MAX_DATASET_UPLOAD_BYTES = _env_int('DEC_EVAL_MAX_DATASET_UPLOAD_BYTES', 0, 0,
+                                    10 * 1024 * 1024 * 1024)
+MAX_SAMPLES = 100000
 MAX_SOURCE_CHARS = 500_000
 
 # Evaluation pipeline. All of them can be overridden through the environment;
@@ -69,3 +85,25 @@ TEST_TIMEOUT = _env_int('TEST_TIMEOUT', 10, 1, 300)
 
 # Per-stream log cap that is sent back from the sandbox container.
 LOG_LIMIT_BYTES = _env_int('DEC_EVAL_LOG_LIMIT_BYTES', 32 * 1024, 1024, 1024 * 1024)
+
+# ---------------------------------------------------------------------------
+# Local vLLM deployment management and GPU monitoring.
+# ---------------------------------------------------------------------------
+VLLM_BIN = os.getenv('DEC_EVAL_VLLM_BIN', '/home/jiang/venvs/vllm/bin/vllm')
+ALLOW_DEPLOY = os.getenv('DEC_EVAL_ALLOW_DEPLOY', '1').strip().lower() not in ('0', 'false', 'no')
+ADMIN_TOKEN = os.getenv('DEC_EVAL_ADMIN_TOKEN', '').strip()
+DEPLOY_START_TIMEOUT = _env_int('DEC_EVAL_DEPLOY_START_TIMEOUT', 240, 10, 3600)
+DEPLOY_STOP_TIMEOUT = _env_int('DEC_EVAL_DEPLOY_STOP_TIMEOUT', 30, 1, 300)
+# Ports the evaluation stack itself uses; never let a deployment take them.
+DEPLOY_RESERVED_PORTS = sorted({
+    int(item) for item in os.getenv(
+        'DEC_EVAL_RESERVED_PORTS', '22,80,443,3080,5173,8001,8010'
+    ).split(',') if item.strip().isdigit()
+})
+DEPLOY_MAX_RUNNING = _env_int('DEC_EVAL_DEPLOY_MAX_RUNNING', 4, 1, 32)
+DEPLOY_LOG_TAIL_BYTES = _env_int('DEC_EVAL_DEPLOY_LOG_TAIL', 32768, 1024, 1_048_576)
+
+GPU_MONITOR_ENABLED = os.getenv('DEC_EVAL_GPU_MONITOR', '1').strip().lower() not in ('0', 'false', 'no')
+GPU_SAMPLE_INTERVAL = _env_float('DEC_EVAL_GPU_INTERVAL', 1.5, 0.5, 10.0)
+GPU_HISTORY_SECONDS = _env_int('DEC_EVAL_GPU_HISTORY', 1800, 60, 86400)
+GPU_METRICS_INTERVAL = _env_float('DEC_EVAL_VLLM_METRICS_INTERVAL', 5.0, 1.0, 60.0)

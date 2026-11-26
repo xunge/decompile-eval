@@ -204,12 +204,23 @@ def test_db_migration_is_idempotent():
     assert {'inference_ms','compile_ms','test_ms','prompt_tokens',
             'completion_tokens','prompt_text','generation_params_json',
             'sandbox_ms','cases_declared','cases_total','cases_passed',
-            'test_case_status','metric_version','detail_json'} <= result_cols
+            'test_case_status','metric_version','detail_json',
+            'source_compile_ok','compile_stage','edit_similarity'} <= result_cols
+    with db.connect() as conn:
+        sample_cols={r[1] for r in conn.execute('PRAGMA table_info(samples)')}
+    assert {'test_protocol','test_wrapper','real_iospec','function_name',
+            'function_signature','metadata_json','oracle_validated',
+            'oracle_test_count','oracle_passed_count','oracle_failed_count',
+            'oracle_error','oracle_detail_json','oracle_signature','oracle_checked_at'} <= sample_cols
     assert 'started_at' in run_cols and 'metric_version' in run_cols
     with db.connect() as conn:
         tables={r[0] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'")}
-    assert {'case_manifests','test_case_results'} <= tables
+    assert {'case_manifests','test_case_results','deployments',
+            'gpu_samples','vllm_samples'} <= tables
+    with db.connect() as conn:
+        model_cols={r[1] for r in conn.execute('PRAGMA table_info(models)')}
+    assert 'deployment_id' in model_cols
 
 
 def test_reference_model_cannot_be_used_as_normal_run():
@@ -227,3 +238,140 @@ def test_reference_model_cannot_be_used_as_normal_run():
         finally:
             with connect() as db:
                 db.execute('DELETE FROM models WHERE id=?',(mid,))
+
+
+def test_dataset_jsonl_has_no_legacy_64mb_cap(monkeypatch):
+    import app.main as main_module
+    # Even if the legacy constant is tiny, dataset parsing must not apply it.
+    monkeypatch.setattr(main_module, 'MAX_UPLOAD_BYTES', 1)
+    raw = json.dumps({
+        'sample_id': 'large-upload-test',
+        'assembly': 'func0:\n ret',
+        'reference_source': 'int func0(void){return 0;}',
+        'tests': [{'code': 'if (func0()!=0) return 1;'}],
+    }).encode()
+    parsed = main_module._read_jsonl(raw)
+    assert len(parsed) == 1
+    assert parsed[0]['sample_key'] == 'large-upload-test'
+
+
+def _jsonl_sample(sample_id='delete-test'):
+    return json.dumps({
+        'sample_id': sample_id,
+        'assembly': 'func0:\n ret',
+        'reference_source': 'int func0(void){return 0;}',
+        'tests': [{'code': 'if (func0()!=0) return 1;'}],
+    }).encode()
+
+
+def test_delete_imported_dataset_cascades_samples():
+    with TestClient(app) as client:
+        imported = client.post('/api/datasets/import',
+            data={'name': 'Delete me', 'version': 'v1', 'description': ''},
+            files={'file': ('delete.jsonl', _jsonl_sample(), 'application/jsonl')})
+        assert imported.status_code == 201, imported.text
+        did = imported.json()['dataset_id']
+        deleted = client.delete(f'/api/datasets/{did}')
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()['samples_deleted'] == 1
+        assert all(d['id'] != did for d in client.get('/api/datasets').json())
+    from app.db import connect
+    with connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM samples WHERE dataset_id=?',
+                          (did,)).fetchone()[0] == 0
+
+
+def test_delete_dataset_with_tasks_is_rejected():
+    from app.db import connect, now
+    with TestClient(app) as client:
+        imported = client.post('/api/datasets/import',
+            data={'name': 'Protected', 'version': 'v1', 'description': ''},
+            files={'file': ('protected.jsonl', _jsonl_sample('protected'), 'application/jsonl')})
+        did = imported.json()['dataset_id']
+        with connect() as db:
+            mid = db.execute('SELECT id FROM models LIMIT 1').fetchone()['id']
+            rid = db.execute('''INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at)
+                                VALUES(?,?,?,?,?,?)''',
+                             (did, mid, 'completed', 1, '{}', now())).lastrowid
+        response = client.delete(f'/api/datasets/{did}')
+        assert response.status_code == 409
+        assert 'task' in response.text
+        still = client.get(f'/api/datasets/{did}/samples')
+        assert still.status_code == 200
+        with connect() as db:
+            db.execute('DELETE FROM runs WHERE id=?', (rid,))
+        assert client.delete(f'/api/datasets/{did}').status_code == 200
+
+
+def test_delete_missing_dataset_returns_404():
+    with TestClient(app) as client:
+        assert client.delete('/api/datasets/999999').status_code == 404
+
+
+def test_delete_unreferenced_model():
+    with TestClient(app) as client:
+        created = client.post('/api/models', json={
+            'name': 'delete-me-model', 'kind': 'openai',
+            'base_url': 'http://127.0.0.1:9999/v1', 'api_model': 'm',
+            'api_mode': 'completion'})
+        mid = created.json()['model_id']
+        response = client.delete(f'/api/models/{mid}')
+        assert response.status_code == 200, response.text
+        assert response.json()['deleted'] == 1
+        assert all(m['id'] != mid for m in client.get('/api/models').json())
+
+
+def test_delete_model_used_by_run_is_rejected():
+    from app.db import connect, now
+    with TestClient(app) as client:
+        created = client.post('/api/models', json={
+            'name': 'run-model', 'kind': 'openai',
+            'base_url': 'http://127.0.0.1:9999/v1', 'api_model': 'm'})
+        mid = created.json()['model_id']
+        with connect() as db:
+            did = db.execute('SELECT id FROM datasets LIMIT 1').fetchone()['id']
+            rid = db.execute('''INSERT INTO runs(dataset_id,model_id,status,total,config_json,created_at)
+                                VALUES(?,?,?,?,?,?)''',
+                             (did, mid, 'completed', 0, '{}', now())).lastrowid
+        assert client.delete(f'/api/models/{mid}').status_code == 409
+        with connect() as db:
+            db.execute('DELETE FROM runs WHERE id=?', (rid,))
+        assert client.delete(f'/api/models/{mid}').status_code == 200
+
+
+def test_delete_model_linked_to_active_deployment_is_rejected():
+    from app.db import connect, now
+    with TestClient(app) as client:
+        created = client.post('/api/models', json={
+            'name': 'deployed-model', 'kind': 'openai',
+            'base_url': 'http://127.0.0.1:9999/v1', 'api_model': 'm'})
+        mid = created.json()['model_id']
+        with connect() as db:
+            did = db.execute('''INSERT INTO deployments
+                (name,served_name,model_path,gpu_ids,port,dtype,max_model_len,
+                 max_num_seqs,max_num_batched_tokens,gpu_memory_utilization,
+                 managed,status,model_id,created_at,config_json)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                ('active-dep','m','', '0', 9999, 'auto', 4096, 8, 2048, 0.5,
+                 0, 'external', mid, now(), '{}')).lastrowid
+            db.execute('UPDATE models SET deployment_id=? WHERE id=?', (did, mid))
+        assert client.delete(f'/api/models/{mid}').status_code == 409
+        with connect() as db:
+            db.execute("UPDATE deployments SET status='stopped' WHERE id=?", (did,))
+        response = client.delete(f'/api/models/{mid}')
+        assert response.status_code == 200, response.text
+        with connect() as db:
+            row = db.execute('SELECT model_id FROM deployments WHERE id=?', (did,)).fetchone()
+            assert row['model_id'] is None
+            db.execute('DELETE FROM deployments WHERE id=?', (did,))
+
+
+def test_reference_model_cannot_be_deleted():
+    from app.db import connect, now
+    with TestClient(app) as client:
+        with connect() as db:
+            mid = db.execute("INSERT INTO models(name,kind,created_at) VALUES(?,?,?)",
+                             ('reference-delete-test', 'reference', now())).lastrowid
+        assert client.delete(f'/api/models/{mid}').status_code == 403
+        with connect() as db:
+            db.execute('DELETE FROM models WHERE id=?', (mid,))

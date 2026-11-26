@@ -44,9 +44,11 @@ from .adapters import (
     BatchUnavailable, Generation, InferenceError, InputTooLong, OfflineBatchAdapter,
     OnlineAdapter, post_with_retries as _post_with_retries,
 )
-from .sandbox import EvalOutcome, evaluate_code_async
+from .sandbox import EvalOutcome, evaluate_code_async, extract_c
+from .exebench import evaluate_exebench_async, diff_io
+from .edit_sim import edit_similarity
 
-EXCLUDED = {'INFRA_ERROR', 'INFERENCE_ERROR'}
+EXCLUDED = {'INFRA_ERROR', 'INFERENCE_ERROR', 'ORACLE_ERROR', 'INVALID_BENCHMARK'}
 TRANSIENT = {'GENERATED', 'COMPILING'}
 TERMINAL_EVAL = {'TEST_PASS', 'WRONG_ANSWER', 'RUNTIME_ERROR', 'TIMEOUT',
                  'COMPILE_ERROR', 'COMPILE_TIMEOUT', 'MODEL_EMPTY', 'INPUT_TOO_LONG'}
@@ -489,7 +491,53 @@ def _program_cases(outcome, info: dict, compile_failed: bool):
     return rows, declared, len(executed), sum(r['passed'] for r in executed), status
 
 
+def _exebench_cases(outcome, tests: list[dict]):
+    rows = []
+    for index, test in enumerate(tests):
+        event = next((x for x in outcome.tests if int(x.get('index', -1)) == index), None)
+        input_text = json.dumps(test.get('input'), ensure_ascii=False)
+        expected = json.dumps(test.get('expected_output'), ensure_ascii=False)
+        if event is None:
+            rows.append(_case_row(
+                case_id=f'e{index}', case_index=index, static_id=index,
+                input_text=input_text, expected_text=expected,
+                compare_expression='', comparison_rule='exebench_diff_io',
+                oracle_source='exebench_wrapper', diagnostic_status='EXEBENCH',
+                status='NOT_RUN_ORACLE_ERROR' if outcome.status == 'ORACLE_ERROR' else 'NOT_EXECUTED',
+                error_type=outcome.status if outcome.status == 'ORACLE_ERROR' else 'NOT_EXECUTED'))
+            continue
+        actual = event.get('actual_output')
+        rows.append(_case_row(
+            case_id=f'e{index}', case_index=index, static_id=index,
+            input_text=input_text, expected_text=expected,
+            input_values_json=input_text, expected_value_json=expected,
+            actual_text=json.dumps(actual, ensure_ascii=False) if actual is not None else '',
+            actual_value_json=json.dumps(actual, ensure_ascii=False) if actual is not None else '',
+            compare_expression='', comparison_rule='exebench_diff_io',
+            passed=int(event.get('status') == 'PASS'),
+            status='PASS' if event.get('status') == 'PASS' else 'FAIL',
+            exit_code=event.get('exit_code'), stdout=str(event.get('stdout') or '')[:150000],
+            stderr=str(event.get('stderr') or '')[:150000],
+            duration_ms=int(event.get('duration_ms') or 0),
+            oracle_source='exebench_wrapper', diagnostic_status='EXEBENCH',
+            error_type=event.get('status') if event.get('status') != 'PASS' else 'NONE'))
+    executed = [r for r in rows if r['status'] in ('PASS', 'FAIL')]
+    if outcome.status in ('ORACLE_ERROR', 'INVALID_BENCHMARK'):
+        status = outcome.status
+    elif outcome.status in ('COMPILE_ERROR', 'LINK_ERROR', 'COMPILE_TIMEOUT'):
+        status = 'NOT_RUN_COMPILE_ERROR'
+    else:
+        status = 'OK'
+    return rows, len(tests), len(executed), sum(r['passed'] for r in executed), status
+
+
 def _build_case_rows(outcome, sample: dict, info: dict):
+    try:
+        tests = json.loads(sample['tests_json'])
+    except (TypeError, ValueError):
+        return [], 0, 0, 0, 'INVALID_HARNESS'
+    if sample.get('test_protocol', '').startswith('exebench'):
+        return _exebench_cases(outcome, tests)
     try:
         tests = json.loads(sample['tests_json'])
     except (TypeError, ValueError):
@@ -684,23 +732,34 @@ def _update_compiled(db, run_id: int, sample: dict, outcome: EvalOutcome,
                      inference_ms: int, sandbox_ms: int, case_rows: list[dict],
                      cases_declared: int, cases_total: int, cases_passed: int,
                      test_case_status: str,
-                     compile_started_at: str = '', compile_finished_at: str = '') -> bool:
+                     compile_started_at: str = '', compile_finished_at: str = '',
+                     edit_sim_value: float | None = None) -> bool:
     latency = inference_ms + sandbox_ms
+    source_ok = outcome.source_compile_success
+    if source_ok is None and outcome.compile_success is not None:
+        # Backward compatibility for synthetic events/tests that only emit the
+        # full-harness compile event.
+        source_ok = outcome.compile_success
+    stage = outcome.compile_stage
+    if not stage and outcome.compile_success is not None:
+        stage = 'ok' if outcome.compile_success else 'harness'
     cur = db.execute('''
-            UPDATE results SET status=?, compile_success=?, tests_passed=?, tests_total=?,
+            UPDATE results SET status=?, compile_success=?, source_compile_ok=?,
+                compile_stage=?, tests_passed=?, tests_total=?,
                 compile_log=?, run_log=?, error=?, compile_ms=?, test_ms=?, sandbox_ms=?,
                 latency_ms=?, cases_declared=?, cases_total=?, cases_passed=?,
                 test_case_status=?, metric_version=?, compile_started_at=?,
-                compile_finished_at=?, detail_json=?, created_at=?
+                compile_finished_at=?, edit_similarity=?, detail_json=?, created_at=?
             WHERE run_id=? AND sample_id=? AND status='GENERATED'
         ''', (outcome.status,
               None if outcome.compile_success is None else int(outcome.compile_success),
+              None if source_ok is None else int(source_ok), stage,
               outcome.tests_passed, outcome.tests_total,
               outcome.compile_log, outcome.run_log, outcome.error,
               outcome.compile_ms, outcome.test_ms, sandbox_ms, latency,
               cases_declared, cases_total, cases_passed, test_case_status,
               METRIC_VERSION, compile_started_at, compile_finished_at,
-              outcome.detail(), now(), run_id, sample['id']))
+              edit_sim_value, outcome.detail(), now(), run_id, sample['id']))
     if cur.rowcount:
         _replace_cases(db, run_id, sample['id'], case_rows)
     return bool(cur.rowcount)
@@ -709,8 +768,8 @@ def _update_compiled(db, run_id: int, sample: dict, outcome: EvalOutcome,
 def _finalize(run_id: int, status: str) -> None:
     def write(db):
         excluded = db.execute(
-            "SELECT COUNT(*) FROM results WHERE run_id=? AND status IN ('INFRA_ERROR','INFERENCE_ERROR')",
-            (run_id,)).fetchone()[0]
+            "SELECT COUNT(*) FROM results WHERE run_id=? AND status IN (?,?,?,?)",
+            (run_id,'INFRA_ERROR','INFERENCE_ERROR','ORACLE_ERROR','INVALID_BENCHMARK')).fetchone()[0]
         completed = db.execute(
             "SELECT COUNT(*) FROM results WHERE run_id=? AND status NOT IN ('GENERATED','COMPILING')",
             (run_id,)).fetchone()[0]
@@ -742,6 +801,44 @@ def _store_progress_final(run_id: int, status: str) -> None:
 # ---------------------------------------------------------------------------
 # Compile worker.
 # ---------------------------------------------------------------------------
+def _exebench_signature(sample: dict) -> str:
+    h = hashlib.sha256()
+    for key in ('reference_source', 'dependencies', 'test_wrapper',
+                'tests_json', 'real_iospec', 'language', 'compiler', 'optimization'):
+        h.update(str(sample.get(key) or '').encode('utf-8'))
+        h.update(b'\0')
+    return h.hexdigest()
+
+
+async def _ensure_exebench_oracle(sample: dict) -> bool:
+    signature = _exebench_signature(sample)
+    if (sample.get('oracle_signature') == signature and
+            sample.get('oracle_validated') in (1, -1)):
+        return sample.get('oracle_validated') == 1
+    tests = json.loads(sample['tests_json'])
+    outcome = await evaluate_exebench_async(
+        sample['reference_source'], sample['reference_source'],
+        sample.get('dependencies') or '', sample.get('test_wrapper') or '',
+        tests, function_signature=sample.get('function_signature') or '',
+        language=sample.get('language') or 'c',
+        compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
+        log_limit=LOG_LIMIT_BYTES)
+    valid = outcome.status == 'TEST_PASS'
+    passed = int(outcome.tests_passed or 0)
+    failed = max(0, len(tests) - passed)
+    error = '' if valid else (outcome.error or outcome.status)
+    def write(db):
+        db.execute('''UPDATE samples SET oracle_validated=?,oracle_test_count=?,
+            oracle_passed_count=?,oracle_failed_count=?,oracle_error=?,
+            oracle_detail_json=?,oracle_signature=?,oracle_checked_at=? WHERE id=?''',
+            (1 if valid else -1, len(tests), passed, failed, error[:2000],
+             json.dumps(outcome.tests, ensure_ascii=False), signature, now(), sample['id']))
+    await _db_write_async(write)
+    sample['oracle_validated'] = 1 if valid else -1
+    sample['oracle_signature'] = signature
+    return valid
+
+
 async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms: int,
                        diagnostics: dict | None = None,
                        submitted_at: str = '', generated_at: str = '') -> None:
@@ -750,10 +847,25 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
     compile_started_at = now()
     started = time.perf_counter()
     try:
-        outcome = await evaluate_code_async(
-            prediction, sample['dependencies'], tests, language=sample['language'],
-            compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
-            log_limit=LOG_LIMIT_BYTES, diagnostic=info.get('diagnostic'))
+        if str(sample.get('test_protocol') or '').startswith('exebench'):
+            if not await _ensure_exebench_oracle(sample):
+                outcome = EvalOutcome(
+                    'ORACLE_ERROR', False, 0, len(tests),
+                    error=f'ExeBench reference Oracle failed: {sample.get("oracle_error") or "see sample oracle fields"}',
+                    harness_mode='exebench', compile_stage='oracle')
+            else:
+                outcome = await evaluate_exebench_async(
+                    prediction, sample['reference_source'],
+                    sample.get('dependencies') or '', sample.get('test_wrapper') or '',
+                    tests, function_signature=sample.get('function_signature') or '',
+                    language=sample.get('language') or 'c',
+                    compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
+                    log_limit=LOG_LIMIT_BYTES)
+        else:
+            outcome = await evaluate_code_async(
+                prediction, sample['dependencies'], tests, language=sample['language'],
+                compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
+                log_limit=LOG_LIMIT_BYTES, diagnostic=info.get('diagnostic'))
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # never let one sample kill the pipeline
@@ -765,10 +877,12 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
     case_rows, cases_declared, cases_total, cases_passed, case_status = \
         _build_case_rows(outcome, sample, info)
     compile_finished_at = now()
+    edit_sim_value = round(edit_similarity(
+        sample.get('reference_source') or '', extract_c(prediction)), 6)
     await _db_write_async(lambda db: _update_compiled(
         db, run_id, sample, outcome, inference_ms, sandbox_ms, case_rows,
         cases_declared, cases_total, cases_passed, case_status,
-        compile_started_at, compile_finished_at))
+        compile_started_at, compile_finished_at, edit_sim_value))
     deltas = dict(compiling=-1, evaluated=1,
                   compile_ms_sum=outcome.compile_ms, test_ms_sum=outcome.test_ms,
                   sandbox_ms_sum=sandbox_ms, cases_declared=cases_declared,

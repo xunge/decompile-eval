@@ -769,3 +769,53 @@ def test_compile_concurrency_default_override_and_resource_guard(monkeypatch):
     monkeypatch.setattr(worker, '_memory_available_mb', lambda: None)
     assert worker._compile_limit(64) == 8
     assert worker._resolve_concurrency({'compile_concurrency': 8})[1] == 8
+
+
+def test_official_source_rc_is_persisted_even_when_harness_stage_fails(monkeypatch):
+    def harness_failure(tests):
+        return EvalOutcome('COMPILE_ERROR', False, 0, len(tests),
+                           source_compile_success=True,
+                           compile_stage='harness',
+                           error='harness signature mismatch')
+
+    rid = create_run(limit=4, ic=2, cc=2)
+    failures = {f'pipe_{i}': harness_failure for i in range(4)}
+    rec = Recorder(fail_compile=failures)
+    install(monkeypatch, rec)
+    worker.process_run(rid)
+
+    rows = sampled_rows(rid)
+    assert all(r['status'] == 'COMPILE_ERROR' for r in rows)
+    assert all(r['source_compile_ok'] == 1 for r in rows)
+    assert all(r['compile_success'] == 0 for r in rows)
+    metrics = summarize(rows)
+    assert metrics['rc'] == 100.0          # official candidate-only compile
+    assert metrics['rc_source'] == 100.0
+    assert metrics['rc_harness'] == 0.0    # full harness build
+    assert metrics['rc_mode'] == 'official_source_compile'
+
+
+def test_edit_similarity_is_persisted_per_result(monkeypatch):
+    rid = create_run(limit=4, ic=2, cc=2)
+    install(monkeypatch, Recorder(infer_delay=0.005, compile_delay=0.005))
+    worker.process_run(rid)
+    rows = sampled_rows(rid)
+    assert all(r['edit_similarity'] is not None for r in rows)
+    assert all(0.0 <= r['edit_similarity'] <= 1.0 for r in rows)
+    metrics = summarize(rows)
+    assert metrics['edit_similarity'] is not None
+    assert metrics['edit_similarity_samples'] == 4
+
+
+def test_get_run_exposes_official_rc_and_edit_similarity_fields(monkeypatch):
+    rid = create_run(limit=4, ic=2, cc=2)
+    install(monkeypatch, Recorder(infer_delay=0.005, compile_delay=0.005))
+    worker.process_run(rid)
+    with TestClient(app) as client:
+        detail = client.get(f'/api/runs/{rid}').json()
+    assert detail['metrics']['rc_mode'] == 'official_source_compile'
+    assert detail['metrics']['edit_similarity'] is not None
+    first = detail['results'][0]
+    assert 'source_compile_ok' in first and 'compile_stage' in first
+    assert 'edit_similarity' in first
+    assert first['edit_similarity'] is not None

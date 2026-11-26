@@ -25,7 +25,7 @@ class ModelCreate(BaseModel):
 
 class _OptimizationMixin(BaseModel):
     optimizations: list[str] = Field(default_factory=lambda:['O0','O1','O2','O3'])
-    sample_limit: int = Field(default=0,ge=0,le=12000)
+    sample_limit: int = Field(default=0,ge=0,le=100000)
 
     @field_validator('optimizations')
     @classmethod
@@ -56,3 +56,24 @@ class BatchRunCreate(RunCreate):
 
     model_path: str | None = Field(default=None, max_length=1000)
     batch_size: int | None = Field(default=None, ge=1, le=4096)
+
+
+class DeploymentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    served_name: str | None = Field(default=None, max_length=100)
+    model_path: str = Field(min_length=1, max_length=1000)
+    gpu_ids: str = Field(default='0', max_length=100)
+    port: int = Field(ge=1024, le=65535)
+    dtype: Literal['auto', 'half', 'float16', 'bfloat16', 'float32'] = 'auto'
+    max_model_len: int = Field(default=4096, ge=128, le=1_000_000)
+    max_num_seqs: int = Field(default=64, ge=1, le=4096)
+    max_num_batched_tokens: int = Field(default=8192, ge=1, le=1_000_000)
+    gpu_memory_utilization: float = Field(default=0.7, ge=0.05, le=0.99)
+    api_mode: Literal['completion', 'chat'] = 'completion'
+
+
+class ExternalDeploymentCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    base_url: str = Field(min_length=7, max_length=500)
+    served_name: str = Field(default='', max_length=100)
+    api_mode: Literal['completion', 'chat'] = 'completion'

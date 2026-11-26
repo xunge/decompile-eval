@@ -1,13 +1,14 @@
-# DecompileEval v0.5 — 大模型反编译并发评测平台
+# DecompileEval v0.6 — 大模型反编译并发评测平台
 
 > Vue 3 + FastAPI + SQLite + Docker + vLLM（OpenAI 兼容 Completion API）。
-> **v0.5 的核心变化：真实 TCP_micro/TCP_macro（不再把完整 harness 当成 1 个用例）、tree-sitter 逐用例诊断、官方 RE 与诊断用例分离、INFERENCE_CONCURRENCY=0 AUTO 持续投递、COMPILE_CONCURRENCY=64 默认与资源保护。**
+> **v0.5 的核心变化：真实 TCP_micro/TCP_macro（不再把完整 harness 当成 1 个用例）、tree-sitter 逐用例诊断、官方 RE 与诊断用例分离、INFERENCE_CONCURRENCY=0 AUTO 持续投递、COMPILE_CONCURRENCY=64 默认与资源保护。v0.6 增加官方 RC 两阶段编译、vLLM 部署/GPU 监控、Edit Similarity 和 ExeBench 官方 wrapper 评测。**
 > v0.4 的 Tokenizer 预算、离线批量适配器、Token/s 与 vLLM /metrics 遥测继续保持。
+> v0.6 新增本地 vLLM 部署管理（启动/日志/停止/重启/恢复）与 nvidia-ml-py GPU 实时监控。
 > 演示数据仅用于验证流程，不作为公开基准成绩。真实模型复现步骤见 [REAL_BENCHMARKS.md](REAL_BENCHMARKS.md)。
 
 ## 一、已实现功能
 
-- **数据集管理**：导入统一 JSONL，查看样本与 O0/O1/O2/O3；支持 C/C++。
+- **数据集管理**：导入统一 JSONL（默认不限制文件字节数、最多 100000 条样本），查看样本与 O0/O1/O2/O3，并删除无评测任务的数据集；支持 C/C++。
 - **模型管理**：OpenAI 兼容接口（vLLM Completion / Chat），API Key 仅从后端环境变量读取。
 - **离线评测**：导入已有 `sample_id` + `prediction`，不重新推理。
 - **参考源码基线**：用**完全相同的编译器、测试程序、Docker 环境**执行数据集自带的 `reference_source`，结果保存为独立任务；失败表示数据集/环境问题，而不是模型错误。
@@ -23,7 +24,7 @@
 - **持久化与恢复**：逐样本结果即时写 SQLite；支持取消、重试、断点续跑；已完成样本不会重复评测。
 - **诊断日志**：容器内 Python runner 输出结构化 JSON；保留编译/测试 stdout、stderr、退出码、信号、超时、耗时和截断标记。
 - **错误分类**：`TEST_PASS / WRONG_ANSWER / RUNTIME_ERROR / TIMEOUT / COMPILE_ERROR / COMPILE_TIMEOUT / MODEL_EMPTY`，基础设施问题单独记为 `INFRA_ERROR`，模型接口失败记为 `INFERENCE_ERROR`。
-- **指标与可视化**：RC / RE / TCP、按优化等级统计、模型对比、推理/编译双进度、吞吐量、逐样本三栏与日志。
+- **指标与可视化**：RC / RE / TCP / Edit Similarity、按优化等级统计、模型对比、推理/编译双进度、吞吐量、逐样本三栏与日志。
 - **REST API**：FastAPI Swagger `http://127.0.0.1:8010/docs`。
 
 当前定位仍是**单用户、单机、本地开发**：单进程内运行、一次评估一个任务、无鉴权，不要暴露公网。
@@ -146,10 +147,18 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/llm4decompile-1.3b-v1.5 \
 | `COMPILE_TIMEOUT` | 60 | 编译超时（秒） |
 | `TEST_TIMEOUT` | 10 | 单个测试用例运行超时（秒） |
 | `MAX_MODEL_LEN` | 4096 | 模型上下文；输入+输出超过即 `INPUT_TOO_LONG` |
+| `DEC_EVAL_MAX_DATASET_UPLOAD_BYTES` | 0 | 数据集上传字节上限；0=不限制（仍最多 100000 条样本） |
 | `TOKENIZER_TIMEOUT` | 10 | vLLM `/tokenize` 超时 |
 | `DEC_EVAL_BATCH_MODEL_PATH` | 空 | 离线批量模式的本地模型路径 |
 | `DEC_EVAL_BATCH_SIZE` | 32 | 离线批量每轮样本数 |
 | `DEC_EVAL_VLLM_METRICS` | `1` | 是否读取 vLLM `/metrics`（0 关闭） |
+| `DEC_EVAL_VLLM_BIN` | `/home/jiang/venvs/vllm/bin/vllm` | 受信任的 vLLM 可执行文件 |
+| `DEC_EVAL_ALLOW_DEPLOY` | `1` | 是否允许部署管理 |
+| `DEC_EVAL_ADMIN_TOKEN` | 空 | 设置后部署写操作需 `X-Admin-Token` |
+| `DEC_EVAL_DEPLOY_MAX_RUNNING` | 4 | 最大活跃部署数 |
+| `DEC_EVAL_GPU_MONITOR` | `1` | 启用 GPU/vLLM 监控线程 |
+| `DEC_EVAL_GPU_INTERVAL` | 1.5 | GPU 采样间隔秒 |
+| `DEC_EVAL_GPU_HISTORY` | 1800 | 历史保留秒数 |
 | `DEC_EVAL_LOG_LIMIT_BYTES` | 32768 | 每个 stdout/stderr 流保留上限，超限标记 truncated |
 | `DEC_EVAL_SANDBOX_IMAGE` | `gcc:14` | 沙箱镜像 |
 | `DEC_EVAL_DATA_DIR` | `./storage` | SQLite 与离线预测目录 |
@@ -205,11 +214,26 @@ v0.5 保留官方 harness 作为 **RE 唯一裁决**，另建诊断层为每个�
 
 对符合 Benchmark 协议的样本集合：
 
-- **RC** = 编译成功函数数 / 官方协议分母
-- **RE** = 官方完整 harness 全部通过的函数数 / 官方协议分母（诊断层不放宽）
+- **RC** = 候选函数单独编译成功数 / 官方协议分母（与 LLM4Decompile 官方 `gcc -S onlyfunc` 口径一致）
+- **RE** = 官方完整 harness 编译成功且全部通过的函数数 / 官方协议分母（诊断层不放宽）
+- **RC_harness** = 候选函数 + 官方 harness 整体编译成功数 / 分母；仅用于诊断，不代替官方 RC
 - **TCP_micro** = 所有可诊断函数通过的原子用例数 / 所有可诊断函数的有效原子用例数
 - **TCP_macro** = mean(每个可诊断函数的通过用例数 / 该函数有效用例数)
 - 默认 TCP = TCP_micro；界面同时显示 micro 与 macro，并标注分母。
+- **Edit Similarity (ES)** = `1 - Levenshtein(target, prediction) / max(len(target), len(prediction))`；
+  - 与官方 `cal_edit_sim.py` 一致：逐行 `strip()`、去掉空行后用 `\n` 连接，按字符编辑距离计算；
+  - `target` 为参考 `reference_source`，`prediction` 为去除 Markdown fence 后的模型输出；
+  - 编译失败/运行失败的样本仍计算 ES（它不依赖执行），`INPUT_TOO_LONG`/`INFERENCE_ERROR` 无输出记为 N/A；
+  - 运行指标为所有有 ES 样本的算术平均，界面显示百分比和样本数。
+
+### 两阶段编译（与官方一致）
+
+- `source` 阶段：`gcc -S` 编译 `include + 候选函数`，不链接测试 harness；**官方 RC 只看这一阶段**；
+- `harness` 阶段：候选 + 完整 harness 编译并执行；**RE 只看这一阶段 + 运行通过**；
+- 当前沙箱使用 `gcc:14`；source 阶段使用 `-std=gnu11 -D_GNU_SOURCE`，并把 GCC 14 升级为 error 的
+  `implicit-function-declaration` / `incompatible-pointer-types` / `int-conversion` 显式降回 warning，
+  以兼容论文时期 GCC 11/12 的编译行为；完整 harness 阶段仍保留严格配置，避免把不可运行的代码算作 RE。
+- 这样 `humaneval_660` 的 `strdup` 候选函数在 source 阶段通过（RC=1），但严格 harness 阶段可能失败（RE=0），与官方两阶段语义一致。
 
 示例：函数 A 有 5 个 case 通过 3 个：RC=1、RE=0、A 的 TCP=3/5。
 两个函数 A(2/2)、B(3/5)：micro=5/7=71.43%，macro=(1.0+0.6)/2=80%。
@@ -223,10 +247,13 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 - `cases_total`：真正执行的 case 数（PASS+FAIL）。
 - `uncovered_cases = declared - total`；`case_coverage = diagnosed_samples / evaluated_samples`。
 - 失败类型分布来自结果状态（COMPILE_ERROR/TIMEOUT/WRONG_ANSWER/RUNTIME_ERROR/...）。
-- 编译失败：RC=0、RE=0；已知 case 记为 `NOT_RUN_COMPILE_ERROR`，不伪造输出，不进入 TCP 分子/分母。
+- 编译阶段分为 `source`（候选函数单独编译，决定官方 RC）与 `harness`（候选+测试整体编译，决定 RE）：
+  - `source` 失败：官方 RC=0、RE=0；
+  - `source` 成功但 `harness` 失败：官方 RC=1、RE=0（例如模型签名与测试调用类型不匹配）；
+  - 已知 case 记为 `NOT_RUN_COMPILE_ERROR`，不伪造输出，不进入 TCP 分子/分母。
 - 环境故障：`INFRA_ERROR` 排除；模型接口失败：`INFERENCE_ERROR` 排除。
 - harness 定义不清晰/无法可靠拆分：`UNSUPPORTED_CASE_EXTRACTION` / `INVALID_HARNESS` / `NO_ASSERT_CASES`，TCP=N/A。
-- `metric_version=tcp_micro_macro_v1`，数据集 SHA-256 与版本写入 run config；旧结果没有逐用例信息时显示“旧结果不可用，需重新诊断评测”。
+- `metric_version=tcp_micro_macro_v1`，`rc_metric_version=official_source_compile_v1`；数据集 SHA-256 与版本写入 run config。旧结果没有 `source_compile_ok`，仍显示旧的整体编译 RC，并标注“旧口径”，不会被静默改写；重新评测后使用官方 RC。
 
 ## 七、逐用例诊断（tree-sitter）
 
@@ -245,11 +272,11 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 
 ## 八、错误诊断与 exit 134
 
-容器内 `runner.py` 逐事件输出 JSON（编译 1 条 + 每个测试 1 条），包含 `exit_code`、`signal`、`timed_out`、`duration_ms`、`stdout`、`stderr`、`*_truncated`。退出码与信号来自 `subprocess` 的 `returncode`，因此 **exit(134) 与 SIGABRT 可区分**。
+容器内 `runner.py` 逐事件输出 JSON（候选源码编译 1 条 + 完整 harness 编译 1 条 + 每个测试 1 条），包含 `exit_code`、`signal`、`timed_out`、`duration_ms`、`stdout`、`stderr`、`*_truncated`。退出码与信号来自 `subprocess` 的 `returncode`，因此 **exit(134) 与 SIGABRT 可区分**。
 
 | 现象 | 分类 |
 |---|---|
-| 编译失败 | `COMPILE_ERROR`（保留编译 stdout/stderr） |
+| 编译失败 | `COMPILE_ERROR`（`compile_stage=source` 或 `harness`，保留编译 stdout/stderr） |
 | 编译超时 | `COMPILE_TIMEOUT` |
 | 测试超时 | `TIMEOUT` |
 | `SIGABRT` + stderr 中明确 `Assertion ... failed` | `WRONG_ANSWER`（断言失败） |
@@ -272,8 +299,11 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 | GET | `/api/overview` | 计数概览 |
 | GET/POST | `/api/datasets`, `/api/datasets/import` | 数据集 |
 | GET | `/api/datasets/{id}/samples` | 样本列表 |
+| DELETE | `/api/datasets/{id}` | 删除数据集及其样本（已有评测任务时 409，需先删除任务） |
 | POST | `/api/datasets/{id}/reference-check` | 创建参考源码基线任务（body: `optimizations`, `sample_limit`, `compile_concurrency`） |
+| POST | `/api/datasets/{id}/exebench-oracle?sample_limit=20` | 批量验证 ExeBench 参考源码 / wrapper，写入 Oracle 状态 |
 | GET/POST | `/api/models`, `/api/models/{id}/test` | 模型 |
+| DELETE | `/api/models/{id}` | 删除无评测任务引用的模型；活跃部署关联模型需先停止/取消部署 |
 | POST | `/api/runs` | 创建在线评测（可选并发数） |
 | POST | `/api/runs/batch` | 创建 vLLM 离线批量评测（`model_path`, `batch_size`） |
 | POST | `/api/runs/offline` | 离线预测评测 |
@@ -313,6 +343,8 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 - `runs.started_at`
 - `results.inference_ms, compile_ms, test_ms, sandbox_ms, prompt_tokens, completion_tokens, prompt_text, generation_params_json, detail_json`
 - `results.cases_declared, cases_total, cases_passed, test_case_status, metric_version`
+- `results.source_compile_ok, compile_stage`（官方 RC 的两阶段编译结果）
+- `results.edit_similarity`（官方 Edit Similarity，0–1；历史结果启动时从已存 model_output/reference_source 回填，不改状态）
 - `results.submitted_at, generated_at, first_token_at, compile_started_at, compile_finished_at`
 - 新表 `case_manifests`（manifest 缓存）与 `test_case_results`（逐用例结果，`run_id+sample_id+case_id` 唯一）
 - `datasets.source_hash`、`runs.metric_version`
@@ -326,7 +358,7 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 cd decompile-eval-mvp/backend
 source .venv/bin/activate
 python -m pytest -q
-# 103 passed, 13 skipped（Docker 用例默认跳过）
+# 159 passed, 18 skipped（Docker 用例默认跳过）
 ```
 
 注意：必须用 `python -m pytest`（让 `backend/` 进入 `sys.path`）；直接 `pytest` 可能报 `No module named 'app'`。
@@ -335,7 +367,7 @@ python -m pytest -q
 
 ```bash
 RUN_DOCKER_TESTS=1 python -m pytest -q tests/test_docker_integration.py
-# 13 passed，覆盖：正常编译、assert失败(SIGABRT)、abort、SIGSEGV、超时、
+# 18 passed，覆盖：正常编译、assert失败(SIGABRT)、abort、SIGSEGV、超时、源码/整体编译两阶段、
 # 编译错误、完整 harness、C++、逐用例失败隔离、动态循环、单次求值、
 # 字符串/浮点/布尔值、特殊字符与日志截断
 ```
@@ -373,7 +405,7 @@ TMPDIR=$PWD/storage/.tmp-docker RUN_DOCKER_TESTS=1 python -m pytest -q tests/tes
 
 真实全流水线（真实 vLLM + 真实 Docker，8 条 HumanEval O0，`inference_concurrency=0` AUTO、`compile_concurrency=4`）：
 
-- 总耗时 18.6s（冷启动）/ 5.0s（镜像与 vLLM 已热）；8/8 完成；RC=87.5%、RE=75.0%、TCP_micro=93.1%、TCP_macro=90.48%；
+- 总耗时 18.6s（冷启动）/ 5.0s（镜像与 vLLM 已热）；8/8 完成；RC=87.5%（旧整体编译口径）、RE=75.0%、TCP_micro=93.1%、TCP_macro=90.48%；
 - 诊断 case 27/29（声明 33，覆盖率 87.5%，其余为编译失败样本的 NOT_RUN 用例）；
 - vLLM 侧最高 running=7、waiting=0；约 1s 内 8 条推理全部完成，随后 GPU 空闲等待 Docker（沙箱约 8–9s/样本，4 worker）。
   这说明 **瓶颈是 Docker 启动/编译吞吐，而不是请求调度批次**；AUTO 已在推理阶段把可用样本全部送满。
@@ -387,6 +419,7 @@ TMPDIR=$PWD/storage/.tmp-docker RUN_DOCKER_TESTS=1 python -m pytest -q tests/tes
 | RE | 50% | 2 个函数 |
 | TCP_micro | 70% | 7/10 个执行 case |
 | TCP_macro | 50% | mean(1.0, 0.0) |
+| Edit Similarity | 运行指标 | 所有有输出的样本平均 |
 | 诊断覆盖率 | 100% | 2/2 函数，10/10 case |
 
 示例 case（单位：原始值）：
@@ -417,7 +450,116 @@ curl -s -X POST http://127.0.0.1:8010/api/runs -H 'Content-Type: application/jso
 curl -s http://127.0.0.1:8010/api/runs/1/progress   # token_rate/eval_rate/elapsed
 ```
 
-## 十四、已知限制
+## 十四、模型部署与 GPU 监控
+
+### 功能
+
+- 网页选择本地模型路径、GPU、端口、dtype、`max-model-len`、`max-num-seqs`、`max-num-batched-tokens`、`gpu-memory-utilization`、接口类型，一键启动独立 vLLM 进程。
+- 固定使用 `/home/jiang/venvs/vllm/bin/vllm`（可用 `DEC_EVAL_VLLM_BIN` 覆盖），参数以 argv 列表传递，**`shell=False`**。
+- 部署列表展示状态、PID、端点、GPU/端口、启动日志、最新请求数/Token 吞吐；支持停止（保留配置可重启）、重启，以及 **取消部署**（停止托管进程并移除部署记录；外部服务只取消监控，不停止外部进程）。
+- 部署成功自动写入现有 `models` 表（同一 `deployment_id` 更新，不重复建模型），评测页可直接选择。
+- 配置持久化到 `deployments`；后端重启后通过 PID + `/proc/<pid>/cmdline` 校验恢复管理，不误杀 PID 复用进程。
+- 外部 vLLM 服务可注册和监控；`managed=0`，stop/restart 返回 409，绝不停止外部进程。
+- GPU 监控基于 **nvidia-ml-py**：利用率、显存、温度、功率、GPU 进程；后端每 1.5s 采样，前端每 2s 刷新，SQLite 保存 1800s 历史，支持利用率/显存/温度/功率曲线。
+- vLLM `/metrics`：running/waiting 请求、输入/输出 Token/s（计数器差分），同时写入历史。
+- 部署权限：`DEC_EVAL_ALLOW_DEPLOY=0` 可完全关闭；设置 `DEC_EVAL_ADMIN_TOKEN` 后写操作必须带 `X-Admin-Token`。前端有管理令牌输入框（sessionStorage）。
+
+### 校验与安全
+
+- 模型路径必须是绝对路径、存在、可读、包含 `config.json`；
+- 端口 1024–65535，拒绝本栈保留端口（8001/8010/5173/3080 等）和已占用端口；
+- GPU id 必须为数字且不超过 NVML 检测数量；启用时检查每卡可用显存；多卡自动加 `--tensor-parallel-size`；
+- dtype/接口类型枚举、所有数值范围校验；最多 `DEC_EVAL_DEPLOY_MAX_RUNNING` 个活跃部署；
+- 停止前再次校验 PID cmdline（vllm + serve + 端口 + 模型路径），不匹配则只标记停止、不发信号；进程使用独立 session，支持 SIGTERM→SIGKILL；
+- 日志写入 `storage/deployments/deployment_<id>.log`，API 只读该受控路径。
+
+### API
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/deployments` | 已部署模型、状态、最新指标 |
+| POST | `/api/deployments` | 启动托管部署（需管理员） |
+| GET | `/api/deployments/{id}` | 详情 |
+| POST | `/api/deployments/{id}/stop` | 停止托管进程（需管理员） |
+| POST | `/api/deployments/{id}/restart` | 按持久化配置重启（需管理员） |
+| DELETE | `/api/deployments/{id}` | 取消部署：停止托管进程并移除配置；外部服务仅取消监控（需管理员） |
+| GET | `/api/deployments/{id}/logs?tail=200` | 启动日志尾部 |
+| GET | `/api/deployments/{id}/metrics?seconds=300` | vLLM 指标历史 |
+| POST | `/api/deployments/external` | 注册外部服务（需管理员） |
+| GET | `/api/gpus?history_seconds=300` | GPU 当前值 + 历史曲线 |
+
+启动示例：
+
+```bash
+curl -X POST http://127.0.0.1:8010/api/deployments \
+  -H 'Content-Type: application/json' -H 'X-Admin-Token: change-me' \
+  -d '{"name":"LLM4Decompile","served_name":"llm4decompile-1.3b-v1.5",
+       "model_path":"/home/jiang/share/model/llm4decompile-1.3b-v1.5",
+       "gpu_ids":"0","port":8002,"dtype":"bfloat16","max_model_len":4096,
+       "max_num_seqs":64,"max_num_batched_tokens":8192,
+       "gpu_memory_utilization":0.7,"api_mode":"completion"}'
+```
+
+环境变量：`DEC_EVAL_VLLM_BIN`、`DEC_EVAL_ALLOW_DEPLOY`、`DEC_EVAL_ADMIN_TOKEN`、`DEC_EVAL_DEPLOY_START_TIMEOUT`、`DEC_EVAL_DEPLOY_STOP_TIMEOUT`、`DEC_EVAL_DEPLOY_MAX_RUNNING`、`DEC_EVAL_GPU_MONITOR`、`DEC_EVAL_GPU_INTERVAL`、`DEC_EVAL_GPU_HISTORY`。
+
+## 十五、ExeBench 支持
+
+ExeBench 使用官方 wrapper 协议，而不是 HumanEval 的 `tests[].program`：
+
+1. 将 `real_deps + 候选函数 + 该测试的 dummy_funcs` 写入 `candidate.c`；
+2. 将官方 `real_exe_wrapper` 中的临时 `#include` 替换为 `candidate.c`；
+3. 在 Docker `gcc:14` 中使用 `g++ -fpermissive` 编译 wrapper、vendored `clib/synthesizer.c`、`nlohmann/json.hpp`；
+4. 每条测试写 `input.json`，执行 `program input.json output.json`；
+5. 用官方 `diff_io` 语义比较输出：类型严格、嵌套 list/dict、浮点 `math.isclose`；
+6. 不同 `(dummy_funcs, dummy_funcs_seed)` 分组编译，相同条件只编译一次。
+
+本地固定的官方依赖在 `backend/app/exebench_deps/`（nlohmann/json 3.11.3、ExeBench synthesizer），运行时不联网下载。
+
+### 转换
+
+```bash
+python scripts/convert_decompile_eval.py --subset exebench \
+  --target-contains real_gcc_x86_O0 --max-samples 20 \
+  --out data/import/exebench_gcc_o0_20.jsonl
+```
+
+输出默认写入 `data/import/`，可直接通过数据集页面上传。样例记录包含 `test_protocol=exebench_io`、`test_wrapper`、`tests[].input/expected_output`、`dummy_funcs`、`dummy_funcs_seed`、`real_iospec`、函数签名及原始 GCC/Clang 标记；不会生成虚假 `program`。
+
+GCC O2 / Clang O0 可显式重新编译并标记：
+
+```bash
+python scripts/convert_decompile_eval.py --subset exebench --compiler gcc \
+  --regenerate --opt O2 --max-samples 20
+python scripts/convert_decompile_eval.py --subset exebench --compiler clang \
+  --regenerate --opt O0 --max-samples 20
+```
+
+### Oracle
+
+- 评测每个 ExeBench 样本前，先用 `reference_source` 编译 wrapper 并执行全部 I/O；
+- Oracle 结果写入 `samples.oracle_validated/test_count/passed_count/failed_count/error/signature`；
+- Oracle 失败标记 `ORACLE_ERROR` 并从 RC/RE/TCP 分母排除，不归责于模型；
+- 数据集页面显示 Oracle 已通过/待验证/失败数量，并可批量触发 `exebench-oracle`。
+
+### 状态与指标
+
+逐测试状态：`PASS`、`WRONG_ANSWER`、`COMPILE_ERROR`、`LINK_ERROR`、`RUNTIME_ERROR`、`TIMEOUT`、`INVALID_OUTPUT`、`ORACLE_ERROR`、`INVALID_BENCHMARK`、`INFRA_ERROR`。
+
+- RC：候选 wrapper 编译+链接成功；
+- RE：全部测试 PASS；
+- TCP micro/macro：使用每条 wrapper I/O 测试的 PASS/FAIL；
+- 编译失败/链接失败记模型失败，测试通过数 0；
+- Oracle 无效、数据错误、Docker 基础设施错误不计入模型失败（单独报告）；
+- 同一函数不同编译器/优化级别使用不同 `sample_id`，共享 `problem_id`。
+
+### 已实际验证
+
+- 20 条官方 ExeBench `real_gcc_x86_O0`：Oracle 20/20 通过；逐样本真实 wrapper 执行 20/20 通过，200/200 tests PASS；
+- 5 条 GCC O2 重新编译样本：Oracle 5/5；
+- 5 条 Clang O0 重新编译样本：Oracle 5/5；
+- Docker 集成测试覆盖 dummy_funcs 分组、非法 JSON 输出、错误 expected output。
+
+## 十六、已知限制
 
 1. 单机、单进程、一次一个任务；跨机/多任务并发需 Redis/RQ 等（本版不强求）。
 2. 离线批量模式要求后端 Python 环境安装 `vllm`，且 `LLM.generate` 是同步 GPU 调用；批次执行中不能被取消，只在批次边界检查取消/背压。
@@ -433,8 +575,10 @@ curl -s http://127.0.0.1:8010/api/runs/1/progress   # token_rate/eval_rate/elaps
 12. 数据集 SHA-256 已写入 `datasets.source_hash` 与 run config；模型 commit/权重哈希、Prompt 哈希仍需人工记录或后续补实验快照。
 13. 参考源码基线会把选中样本全部重跑一遍，数据集很大时耗时明显，可先限制 `sample_limit`。
 14. `compile_ms` 是容器内 gcc 耗时；Docker 启动开销记录在 `sandbox_ms`，两者与 `inference_ms` 共同构成 `latency_ms`。
+15. GPU 监控依赖 NVIDIA 驱动与 nvidia-ml-py；无驱动/容器内无 `/dev/nvidia*` 时 `/api/gpus` 返回 available=false，部署功能仍可用但无 GPU 曲线（本项目的自动化测试用 fake NVML，真实 vLLM 启动需在有 GPU 的主机后端执行）。
+16. 部署管理默认只允许可信本地管理员；跨机器/多租户部署需要额外鉴权、资源配额与进程隔离。
 
-## 十五、项目结构
+## 十七、项目结构
 
 ```text
 backend/
@@ -446,7 +590,13 @@ backend/
     schemas.py    API 参数与 Prompt 模板
     sandbox.py    结构化 Docker 编译/测试、信号与错误分类（同步 + 异步）
     worker.py     异步生产者-消费者流水线、进度、取消/续跑、重试
-    main.py       REST API、指标、删除、参考源码检查
+    main.py       REST API、指标、删除、参考源码检查、部署/GPU 路由
+    deployments.py vLLM 部署校验、启动、恢复、停止、外部注册
+    gpu.py        nvidia-ml-py 采样、vLLM /metrics、历史曲线
+    edit_sim.py   官方 Edit Similarity
+    exebench.py   ExeBench wrapper 执行/Oracle/diff_io
+    exebench_runner.py Docker 内 ExeBench wrapper 运行器
+    exebench_deps/ 固定版本 nlohmann/json 与 synthesizer
     seed.py       演示样本
   tests/
     test_api.py               API/删除/迁移/指标
@@ -455,6 +605,11 @@ backend/
     test_adapters.py           Adapter / Tokenizer / 离线批量 / metrics
     test_case_extract.py       断言解析/重写/动态/边界
     test_cases.py              TCP micro/macro、case 合并、API 导出
+    test_deployments.py        部署校验/启动/停止/恢复/权限/外部服务
+    test_deployment_process.py 真实进程生命周期（fake vLLM，无 GPU）
+    test_gpu.py                NVML/GPU 历史/vLLM 指标 mock 测试
+    test_exebench.py           ExeBench 导入/diff_io/状态/分组
+    test_exebench_docker.py    ExeBench 真实 wrapper Oracle 测试（opt-in）
     test_docker_integration.py 真实 Docker + 诊断用例（opt-in）
     test_real_bench_adapters.py
     test_sandbox.py

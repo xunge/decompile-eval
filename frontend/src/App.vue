@@ -26,18 +26,33 @@ const datasetForm = ref({name:'自定义数据集',version:'v1',description:''})
 const modelForm = ref({name:'',kind:'openai',base_url:'http://127.0.0.1:8001/v1',api_model:'',api_mode:'completion',api_key_env:'',system_prompt:'You are an expert binary decompiler. Output only valid C source code.'})
 const runForm = ref({dataset_id:null,model_id:null,optimizations:['O0','O1','O2','O3'],sample_limit:0,max_tokens:1024,temperature:0,inference_concurrency:0,compile_concurrency:64,generation_mode:'online',model_path:'',batch_size:32,prompt_template:'# This is the assembly code:\n{assembly}\n# What is the source code?\n'})
 const offlineForm = ref({dataset_id:null,name:'离线结果导入'})
+const deployments = ref([])
+const gpuData = ref({available:false,error:'',devices:[],sampled_at:''})
+const deployLogs = ref(null)
+const deployLogId = ref(null)
+const adminToken = ref(sessionStorage.getItem('deployAdminToken') || '')
+const deployBusy = ref(false)
+const deployForm = ref({
+  name:'llm4decompile', served_name:'llm4decompile-1.3b-v1.5',
+  model_path:'/home/jiang/share/model/llm4decompile-1.3b-v1.5',
+  gpu_ids:'0', port:8002, dtype:'bfloat16', max_model_len:4096,
+  max_num_seqs:64, max_num_batched_tokens:8192,
+  gpu_memory_utilization:0.7, api_mode:'completion'
+})
+const externalForm = ref({name:'外部 vLLM',base_url:'http://127.0.0.1:8001/v1',served_name:'',api_mode:'completion'})
 
 const nav = [
   ['overview','◫','评测总览'],['datasets','▤','数据集管理'],
-  ['models','◇','模型管理'],['newrun','⊕','新建评测'],
+  ['models','◇','模型管理'],['deploy','▣','模型部署'],['newrun','⊕','新建评测'],
   ['runs','≡','评测任务'],['compare','▥','模型对比']
 ]
-const titles = {'overview':'评测总览','datasets':'数据集管理','models':'模型管理','newrun':'新建评测任务','runs':'评测任务','compare':'模型对比'}
-const statusLabel = {'PASS':'通过','FAIL':'失败','NOT_RUN_COMPILE_ERROR':'编译失败未运行','NOT_RUN_DIAG_ERROR':'诊断无法运行','NOT_EXECUTED':'未执行','queued':'排队中','running':'评测中','cancel_requested':'停止中','completed':'已完成','completed_with_errors':'部分基础设施失败','cancelled':'已停止','interrupted':'已中断','TEST_PASS':'测试通过','WRONG_ANSWER':'结果错误','COMPILE_ERROR':'编译失败','COMPILE_TIMEOUT':'编译超时','RUNTIME_ERROR':'运行异常','TIMEOUT':'执行超时','INFRA_ERROR':'沙箱错误','INFERENCE_ERROR':'模型接口错误','MODEL_EMPTY':'空输出','GENERATED':'已生成待编译','COMPILING':'编译测试中','PASS':'通过','ASSERT_FAILURE':'断言失败','INPUT_TOO_LONG':'输入超长'}
+const titles = {'overview':'评测总览','datasets':'数据集管理','models':'模型管理','deploy':'模型部署与 GPU 监控','newrun':'新建评测任务','runs':'评测任务','compare':'模型对比'}
+const statusLabel = {'PASS':'通过','FAIL':'失败','NOT_RUN_COMPILE_ERROR':'编译失败未运行','NOT_RUN_DIAG_ERROR':'诊断无法运行','NOT_EXECUTED':'未执行','queued':'排队中','running':'评测中','cancel_requested':'停止中','completed':'已完成','completed_with_errors':'部分基础设施失败','cancelled':'已停止','interrupted':'已中断','TEST_PASS':'测试通过','WRONG_ANSWER':'结果错误','COMPILE_ERROR':'编译失败','COMPILE_TIMEOUT':'编译超时','RUNTIME_ERROR':'运行异常','TIMEOUT':'执行超时','INFRA_ERROR':'沙箱错误','INFERENCE_ERROR':'模型接口错误','MODEL_EMPTY':'空输出','GENERATED':'已生成待编译','COMPILING':'编译测试中','PASS':'通过','ASSERT_FAILURE':'断言失败','INPUT_TOO_LONG':'输入超长','LINK_ERROR':'链接失败','INVALID_OUTPUT':'输出非法','ORACLE_ERROR':'Oracle 无效','INVALID_BENCHMARK':'Benchmark 无效','NOT_RUN_ORACLE_ERROR':'Oracle 失败未运行','starting':'启动中','failed':'启动失败','stopped':'已停止','unreachable':'不可达','external':'外部服务'}
 const statusText = s => statusLabel[s] || s || '—'
 const percent = v => v === null || v === undefined ? 'N/A' : `${Number(v).toFixed(1)}%`
 const rate = v => v === null || v === undefined ? 0 : Math.max(0,Math.min(100,Number(v)))
 const dateTime = d => d ? new Date(d).toLocaleString('zh-CN') : '—'
+const jsonText = v => v === null || v === undefined ? '—' : JSON.stringify(v)
 const isActiveRun = status => ['queued','running','cancel_requested'].includes(status)
 const selectedRuns = computed(() => runs.value.filter(r=>compareIds.value.includes(r.id)))
 const completedRuns = computed(() => runs.value.filter(r=>['completed','completed_with_errors'].includes(r.status)))
@@ -55,7 +70,7 @@ const progressItems = computed(() => {
     {label:'失败样本', value:p.failed},
   ]
 })
-const testStatusText = s => ({'PASS':'通过','ASSERT_FAILURE':'断言失败','WRONG_ANSWER':'结果错误','RUNTIME_ERROR':'运行异常','TIMEOUT':'超时','INFRA_ERROR':'沙箱错误','INPUT_TOO_LONG':'输入超长'}[s] || s || '—')
+const testStatusText = s => ({'PASS':'通过','ASSERT_FAILURE':'断言失败','WRONG_ANSWER':'结果错误','RUNTIME_ERROR':'运行异常','TIMEOUT':'超时','INFRA_ERROR':'沙箱错误','INPUT_TOO_LONG':'输入超长','LINK_ERROR':'链接失败','INVALID_OUTPUT':'输出非法','ORACLE_ERROR':'Oracle 无效','INVALID_BENCHMARK':'Benchmark 无效','NOT_RUN_ORACLE_ERROR':'Oracle 失败未运行','starting':'启动中','failed':'启动失败','stopped':'已停止','unreachable':'不可达','external':'外部服务'}[s] || s || '—')
 const testTagClass = s => s==='PASS' ? 'TEST_PASS' : s==='TIMEOUT' ? 'TIMEOUT' : s==='ASSERT_FAILURE' ? 'WRONG_ANSWER' : 'RUNTIME_ERROR'
 const fmtRate = v => (v===undefined||v===null) ? '—' : `${Number(v).toFixed(2)} 样本/s`
 const fmtElapsed = v => {
@@ -88,7 +103,10 @@ async function refresh() {
   if (!offlineForm.value.dataset_id && d.length) offlineForm.value.dataset_id=d[0].id
   if (!runForm.value.model_id && m.length) runForm.value.model_id=m.find(x=>x.kind==='fixture')?.id || m[0].id
 }
-function setPage(p){active.value=p; selectedResult.value=null}
+function setPage(p){
+  active.value=p; selectedResult.value=null
+  if(p==='deploy'){loadDeployments();loadGpu()}
+}
 async function showDataset(d) {
   await safely(async()=>{
     selectedDataset.value=d
@@ -106,6 +124,31 @@ async function uploadDataset() {
     await refresh()
     message.value=`成功导入 ${r.sample_count} 个样本（数据集 #${r.dataset_id}）`
     uploadFile.value=null
+  })
+}
+async function deleteDataset(d) {
+  if(!window.confirm(`确定删除数据集「${d.name}」？\n将同时删除 ${d.sample_count} 个样本；已有评测任务的数据集不能删除，请先删除任务。`))return
+  await safely(async()=>{
+    const r=await request(`/datasets/${d.id}`,{method:'DELETE'})
+    message.value=`已删除数据集「${r.name}」及其 ${r.samples_deleted} 个样本`
+    selectedDataset.value=null
+    datasetSamples.value=[]
+    await refresh()
+  })
+}
+async function exebenchOracle(d) {
+  await safely(async()=>{
+    const r=await request(`/datasets/${d.id}/exebench-oracle?sample_limit=50`,{method:'POST'})
+    message.value=`Oracle 验证完成：检查 ${r.checked}，有效 ${r.valid}，失败 ${r.failed}`
+    await refresh()
+  })
+}
+async function deleteModel(m) {
+  if(!window.confirm(`确定删除模型「${m.name}」？\n有评测任务引用的模型不能删除。已部署模型需先在「模型部署」中停止/取消部署。`))return
+  await safely(async()=>{
+    await request(`/models/${m.id}`,{method:'DELETE'})
+    message.value=`模型「${m.name}」已删除`
+    await refresh()
   })
 }
 async function addModel() {
@@ -251,13 +294,95 @@ function toggleOpt(opt) {
   const list=runForm.value.optimizations
   runForm.value.optimizations=list.includes(opt)?list.filter(x=>x!==opt):[...list,opt]
 }
+
+const deployStatusText = s => ({starting:'启动中',running:'运行中',failed:'启动失败',stopped:'已停止',unreachable:'不可达',external:'外部运行'}[s] || s || '—')
+const deployTagClass = s => s === 'running' || s === 'external' ? 'TEST_PASS' : s === 'starting' ? 'COMPILING' : s === 'failed' ? 'RUNTIME_ERROR' : s === 'unreachable' ? 'TIMEOUT' : 'COMPILE_ERROR'
+const adminHeaders = () => adminToken.value ? {'X-Admin-Token': adminToken.value} : {}
+const saveAdminToken = () => { sessionStorage.setItem('deployAdminToken', adminToken.value) }
+function sparkPath(points, key, maxValue) {
+  if(!points || points.length < 2) return ''
+  const width = 220, height = 44, max = Math.max(1, Number(maxValue) || 1)
+  return points.map((p, i) => {
+    const x = (i * width / (points.length - 1)).toFixed(1)
+    const y = (height - Math.max(0, Math.min(max, Number(p[key]) || 0)) / max * height).toFixed(1)
+    return `${i ? 'L' : 'M'}${x},${y}`
+  }).join(' ')
+}
+function gpuMemoryPercent(device) {
+  if(!device.memory_total_mb) return 0
+  return Math.max(0, Math.min(100, 100 * (device.memory_used_mb || 0) / device.memory_total_mb))
+}
+async function loadDeployments() {
+  try {
+    const [d, m] = await Promise.all([request('/deployments'), request('/models')])
+    deployments.value = d
+    models.value = m
+  } catch(e) { /* leave previous data */ }
+}
+async function loadGpu() {
+  try { gpuData.value = await request('/gpus?history_seconds=300') } catch(e) { /* GPU/API transient */ }
+}
+async function startDeployment() {
+  await safely(async()=>{
+    saveAdminToken()
+    deployBusy.value = true
+    try {
+      const created = await request('/deployments',{method:'POST',
+        headers:{'Content-Type':'application/json',...adminHeaders()},
+        body:JSON.stringify(deployForm.value)})
+      message.value = `部署 #${created.id} 已提交，正在等待 vLLM 启动`
+      await loadDeployments()
+    } finally { deployBusy.value = false }
+  })
+}
+async function registerExternal() {
+  await safely(async()=>{
+    saveAdminToken()
+    await request('/deployments/external',{method:'POST',
+      headers:{'Content-Type':'application/json',...adminHeaders()},
+      body:JSON.stringify(externalForm.value)})
+    message.value = '外部 vLLM 服务已注册并开始监控'
+    await loadDeployments()
+  })
+}
+async function deployAction(id, action) {
+  const label = action === 'stop' ? '停止' : '重启'
+  if(!window.confirm(`确定${label}部署 #${id}？${action==='stop'?'停止后模型将不可用于评测。':''}`))return
+  await safely(async()=>{
+    saveAdminToken()
+    await request(`/deployments/${id}/${action}`,{method:'POST',headers:adminHeaders()})
+    message.value = `部署 #${id} 已提交${label}请求`
+    await loadDeployments();await loadGpu()
+  })
+}
+async function cancelDeployment(d) {
+  const effect = d.managed
+    ? '托管 vLLM 进程将被停止，部署配置会被移除；未被评测任务引用的自动注册模型也会删除。'
+    : '仅取消监控并移除部署记录，外部 vLLM 进程不会被停止。'
+  if(!window.confirm(`确定取消部署 #${d.id}「${d.name}」？\n${effect}`))return
+  await safely(async()=>{
+    saveAdminToken()
+    await request(`/deployments/${d.id}`,{method:'DELETE',headers:adminHeaders()})
+    if(deployLogId.value===d.id){deployLogs.value=null;deployLogId.value=null}
+    message.value = `部署 #${d.id} 已取消${d.managed?'，vLLM 进程已停止':'（外部进程未受影响）'}`
+    await loadDeployments(); await loadGpu()
+  })
+}
+async function showDeployLogs(d) {
+  await safely(async()=>{
+    const data = await request(`/deployments/${d.id}/logs?tail=400`)
+    deployLogId.value = d.id
+    deployLogs.value = data.log || '(暂无日志)'
+  })
+}
 function toggleCompare(id) {
   if(compareIds.value.includes(id))compareIds.value=compareIds.value.filter(x=>x!==id)
   else if(compareIds.value.length<8) compareIds.value=[...compareIds.value,id]
 }
-let poller, progressPoller
+let poller, progressPoller, deployPoller
 onMounted(async()=>{
   await safely(refresh)
+  if(active.value==='deploy'){await loadDeployments();await loadGpu()}
   poller=setInterval(async()=>{
     try {
       if(runs.value.some(r=>isActiveRun(r.status)) || active.value==='overview'){
@@ -271,8 +396,12 @@ onMounted(async()=>{
     }catch(e){ /* individual errors appear on explicit actions */ }
   },2500)
   progressPoller=setInterval(fetchProgress,1000)
+  deployPoller=setInterval(async()=>{
+    if(active.value!=='deploy')return
+    await Promise.all([loadDeployments(),loadGpu()])
+  },2000)
 })
-onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
+onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterval(deployPoller)})
 </script>
 
 <template>
@@ -292,7 +421,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
     </aside>
 
     <main class="main">
-      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> {{titles[active]}}</div><div class="topright"><span class="pill soft">v0.5 · 真实TCP</span><span class="avatar">DE</span></div></header>
+      <header class="topbar"><div class="breadcrumb">工作空间 <span>/</span> {{titles[active]}}</div><div class="topright"><span class="pill soft">v0.6 · 部署与监控</span><span class="avatar">DE</span></div></header>
       <section class="content">
         <div v-if="error" class="notice error"><strong>操作失败</strong>　{{error}}<button @click="error=''">×</button></div>
         <div v-if="message" class="notice success">{{message}}<button @click="message=''">×</button></div>
@@ -322,8 +451,8 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
           <div class="heading-row"><div><span class="eyebrow">DATASETS</span><h1>数据集管理</h1><p>导入统一 JSONL 格式的反编译基准样本。</p></div></div>
           <div class="two-columns col-left-wide">
             <div class="panel"><div class="panel-head"><div><h2>已导入数据集</h2><p>点击查看样本列表</p></div></div>
-              <div class="dataset-cards"><button v-for="d in datasets" :key="d.id" class="dataset-item" :class="{selected:selectedDataset?.id===d.id}" @click="showDataset(d)"><span class="dataset-symbol">▤</span><span class="dataset-info"><strong>{{d.name}}</strong><small>{{d.version}} · {{d.description}}</small></span><span class="right-count">{{d.sample_count}}<small>样本</small></span></button></div>
-              <div v-if="selectedDataset" class="dataset-actions"><button class="secondary" :disabled="loading" @click="referenceCheck(selectedDataset)">验证参考源码（同一沙箱）</button><span class="tip">结果保存为独立任务；参考源码失败说明数据集/环境有问题，不用于提高模型 RE。</span></div>
+              <div class="dataset-cards"><button v-for="d in datasets" :key="d.id" class="dataset-item" :class="{selected:selectedDataset?.id===d.id}" @click="showDataset(d)"><span class="dataset-symbol">▤</span><span class="dataset-info"><strong>{{d.name}}</strong><small>{{d.version}} · {{d.description}}</small><small v-if="d.exebench_count">ExeBench · {{d.compilers.join('/')}} · {{d.optimizations.join('/')}} · Oracle {{d.oracle_validated_count}}/{{d.exebench_count}}（失败 {{d.oracle_failed_count}}）</small><small v-else>{{d.sample_count}} 个样本</small></span><span class="right-count">{{d.sample_count}}<small>样本</small></span></button></div>
+              <div v-if="selectedDataset" class="dataset-actions"><button class="secondary" :disabled="loading" @click="referenceCheck(selectedDataset)">验证参考源码（同一沙箱）</button><button v-if="selectedDataset.exebench_count" class="secondary" :disabled="loading" @click="exebenchOracle(selectedDataset)">验证 ExeBench Oracle</button><button class="ghost danger" :disabled="loading" @click="deleteDataset(selectedDataset)">删除数据集</button><span class="tip">结果保存为独立任务；参考源码失败说明数据集/环境有问题，不用于提高模型 RE。已有任务的数据集需先删除任务。</span></div>
               <template v-if="selectedDataset"><div class="subheading">{{selectedDataset.name}} · 样本预览</div><div class="table-wrap"><table><thead><tr><th>样本 ID</th><th>问题</th><th>优化</th><th>编译器</th></tr></thead><tbody><tr v-for="s in datasetSamples" :key="s.id"><td class="mono">{{s.sample_key}}</td><td>{{s.problem_id}}</td><td><span class="pill">{{s.optimization}}</span></td><td>{{s.compiler}}</td></tr></tbody></table></div></template>
             </div>
             <div class="panel form-panel"><div class="panel-head"><div><h2>导入 JSONL</h2><p>包含汇编、参考源码和测试用例</p></div></div>
@@ -332,7 +461,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               <label>说明<input v-model="datasetForm.description" placeholder="数据集介绍" /></label>
               <label>选择 JSONL 文件<input type="file" accept=".jsonl" @change="uploadFile=$event.target.files[0]" /></label>
               <button class="primary wide" :disabled="loading" @click="uploadDataset">导入数据集</button>
-              <p class="tip">文件上限 64 MB、12000 条样本；支持 C/C++，必须附带 tests。</p>
+              <p class="tip">默认不限制上传文件大小（最多 100000 条样本）；支持 C/C++，必须附带 tests。大文件会占用后端内存。</p>
             </div>
           </div>
         </template>
@@ -341,7 +470,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
           <div class="heading-row"><div><span class="eyebrow">MODELS</span><h1>模型管理</h1><p>统一管理 OpenAI 兼容推理接口，密钥只从服务端环境变量读取。</p></div></div>
           <div class="two-columns">
             <div class="panel"><div class="panel-head"><div><h2>已注册模型</h2><p>{{models.length}} 个可选模型</p></div></div>
-              <div v-for="m in models" :key="m.id" class="model-item"><div class="model-dot">◇</div><div class="model-info"><strong>{{m.name}}</strong><small>{{m.kind==='fixture'?'演示固定输出（非 LLM）':m.kind==='offline'?'离线预测文件':m.api_model+' · '+m.base_url}}</small></div><button class="ghost" :disabled="loading" @click="testModel(m)">检查</button></div>
+              <div v-for="m in models" :key="m.id" class="model-item"><div class="model-dot">◇</div><div class="model-info"><strong>{{m.name}}</strong><small>{{m.kind==='fixture'?'演示固定输出（非 LLM）':m.kind==='offline'?'离线预测文件':m.api_model+' · '+m.base_url}}</small><small v-if="m.deployment_id" class="tip">部署 #{{m.deployment_id}} · {{deployStatusText(m.deployment_status)}} · port {{m.deployment_port || '—'}}</small></div><div class="actions"><button class="ghost" :disabled="loading" @click="testModel(m)">检查</button><button class="ghost danger" :disabled="loading" @click="deleteModel(m)">删除</button></div></div>
             </div>
             <div class="panel form-panel"><div class="panel-head"><div><h2>添加模型</h2><p>OpenAI / vLLM 兼容 Chat Completions API</p></div></div>
               <label>显示名称<input v-model="modelForm.name" placeholder="例如 DeSIR-6.7B" /></label>
@@ -351,6 +480,76 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               <label>API Key 对应环境变量名（可空）<input v-model="modelForm.api_key_env" placeholder="OPENAI_API_KEY" /></label>
               <button class="primary wide" :disabled="loading" @click="addModel">注册模型</button>
               <p class="tip">不要在这里粘贴实际 API Key。若使用 vLLM 本地服务，环境变量名可留空。</p>
+            </div>
+          </div>
+        </template>
+
+        <template v-if="active==='deploy'">
+          <div class="heading-row"><div><span class="eyebrow">DEPLOY & GPU</span><h1>模型部署与 GPU 监控</h1><p>在本机启动独立 vLLM 进程，或注册外部服务；部署成功自动加入评测模型列表。</p></div><button class="secondary" @click="loadDeployments();loadGpu()">刷新 ↻</button></div>
+
+          <div v-if="gpuData.available===false" class="notice error"><strong>NVML 不可用</strong>　{{gpuData.error || '当前环境无法读取 NVIDIA 驱动'}}。部署功能仍可使用，但无法显示 GPU 监控。</div>
+          <div class="gpu-grid">
+            <div v-for="g in gpuData.devices" :key="g.index" class="gpu-card">
+              <div class="gpu-head"><div><strong>GPU {{g.index}}</strong><small>{{g.name || g.uuid}}</small></div><span class="tag" :class="(g.utilization||0)>80?'RUNTIME_ERROR':'TEST_PASS'">利用率 {{g.utilization ?? '—'}}%</span></div>
+              <div class="gpu-bars">
+                <div><label>显存 {{g.memory_used_mb ?? '—'}} / {{g.memory_total_mb ?? '—'}} MiB</label><div class="bar-track"><i :style="{width:gpuMemoryPercent(g)+'%',background:'#367dd6'}"></i></div></div>
+                <div class="gpu-stats"><span>温度 <b>{{g.temperature_c ?? '—'}}°C</b></span><span>功率 <b>{{g.power_w ?? '—'}} / {{g.power_limit_w ?? '—'}} W</b></span><span>进程 <b>{{g.processes?.length || 0}}</b></span></div>
+              </div>
+              <div class="gpu-sparks">
+                <div><span>利用率</span><svg viewBox="0 0 220 44" preserveAspectRatio="none"><path :d="sparkPath(g.history,'utilization',100)" fill="none" stroke="#367dd6" stroke-width="2"/></svg></div>
+                <div><span>显存</span><svg viewBox="0 0 220 44" preserveAspectRatio="none"><path :d="sparkPath(g.history,'memory_used_mb',g.memory_total_mb||1)" fill="none" stroke="#18a78e" stroke-width="2"/></svg></div>
+                <div><span>温度</span><svg viewBox="0 0 220 44" preserveAspectRatio="none"><path :d="sparkPath(g.history,'temperature_c',100)" fill="none" stroke="#d08a35" stroke-width="2"/></svg></div>
+                <div><span>功率</span><svg viewBox="0 0 220 44" preserveAspectRatio="none"><path :d="sparkPath(g.history,'power_w',g.power_limit_w||1)" fill="none" stroke="#8c68cf" stroke-width="2"/></svg></div>
+              </div>
+              <div class="gpu-processes"><span v-for="p in g.processes" :key="p.pid" class="pill">PID {{p.pid}} {{p.name || ''}} · {{p.used_memory_mb ?? '?'}} MiB</span><span v-if="!g.processes?.length" class="tip">无运行进程</span></div>
+            </div>
+            <div v-if="gpuData.available && !gpuData.devices.length" class="panel empty">未检测到 GPU。</div>
+          </div>
+          <p class="tip">GPU 与 vLLM 指标每 2 秒刷新，历史窗口 300 秒（后端采样 1.5 秒）。外部服务只监控，不会被停止。</p>
+
+          <div class="panel">
+            <div class="panel-head"><div><h2>已部署模型</h2><p>托管进程可停止/重启；外部服务只读监控</p></div><span class="pill">{{deployments.length}} 个部署</span></div>
+            <div class="table-wrap"><table><thead><tr><th>ID</th><th>名称 / 模型</th><th>状态</th><th>端点</th><th>资源</th><th>vLLM 请求</th><th>Token/s</th><th>操作</th></tr></thead><tbody>
+              <tr v-for="d in deployments" :key="d.id">
+                <td class="mono">#{{d.id}}</td>
+                <td><strong>{{d.name}}</strong><small class="mono">{{d.served_name}}</small><div class="tip mono">{{d.model_path || '(external)'}}</div></td>
+                <td><span class="tag" :class="deployTagClass(d.status)">{{deployStatusText(d.status)}}</span><small v-if="d.error" class="danger-text">{{d.error}}</small><small v-if="d.managed && d.pid"> PID {{d.pid}}</small></td>
+                <td class="mono">{{d.base_url}}</td>
+                <td>GPU {{d.gpu_ids || '—'}}<br><small>port {{d.port || '—'}} · {{d.dtype}} · {{d.gpu_memory_utilization}}</small></td>
+                <td><span v-if="d.metrics">运行 {{d.metrics.running ?? '—'}} / 等待 {{d.metrics.waiting ?? '—'}}</span><span v-else>—</span></td>
+                <td><small>入 {{d.metrics?.input_tokens_per_sec ?? '—'}} · 出 {{d.metrics?.output_tokens_per_sec ?? '—'}}</small></td>
+                <td><div class="actions"><button class="ghost" @click="showDeployLogs(d)" :disabled="!d.managed">日志</button><button class="ghost danger" v-if="d.managed && d.status!=='stopped'" @click="deployAction(d.id,'stop')">停止</button><button class="ghost" v-if="d.managed" @click="deployAction(d.id,'restart')">重启</button><button class="ghost danger" :title="d.managed?'停止并移除部署配置':'仅取消监控，不停止外部进程'" @click="cancelDeployment(d)">取消部署</button><span v-if="!d.managed" class="tip">外部</span></div></td>
+              </tr>
+              <tr v-if="!deployments.length"><td colspan="8" class="empty">尚无部署。</td></tr>
+            </tbody></table></div>
+          </div>
+
+          <div class="two-columns col-left-wide">
+            <div class="panel form-panel"><div class="panel-head"><div><h2>启动本地 vLLM</h2><p>使用 /home/jiang/venvs/vllm/bin/vllm serve（shell=False）</p></div></div>
+              <div class="deploy-grid">
+                <label>部署名称<input v-model="deployForm.name" /></label>
+                <label>服务模型名<input v-model="deployForm.served_name" /></label>
+                <label>本地模型路径<input v-model="deployForm.model_path" /></label>
+                <label>GPU（如 0 或 0,1）<input v-model="deployForm.gpu_ids" /></label>
+                <label>端口<input v-model.number="deployForm.port" type="number" min="1024" max="65535" /></label>
+                <label>dtype<select v-model="deployForm.dtype"><option>auto</option><option>bfloat16</option><option>float16</option><option>half</option><option>float32</option></select></label>
+                <label>max-model-len<input v-model.number="deployForm.max_model_len" type="number" /></label>
+                <label>max-num-seqs<input v-model.number="deployForm.max_num_seqs" type="number" /></label>
+                <label>max-num-batched-tokens<input v-model.number="deployForm.max_num_batched_tokens" type="number" /></label>
+                <label>gpu-memory-utilization<input v-model.number="deployForm.gpu_memory_utilization" type="number" step="0.05" min="0.05" max="0.99" /></label>
+                <label>接口类型<select v-model="deployForm.api_mode"><option value="completion">Completion</option><option value="chat">Chat</option></select></label>
+                <label>管理令牌（可选）<input v-model="adminToken" type="password" placeholder="DEC_EVAL_ADMIN_TOKEN" @change="saveAdminToken" /></label>
+              </div>
+              <button class="primary wide" :disabled="deployBusy" @click="startDeployment">▶ 启动并注册模型</button>
+              <p class="tip">参数会持久化；后端重启后会通过 PID + /proc cmdline 校验并恢复对现存进程的管理。禁止使用 shell。</p>
+            </div>
+            <div class="panel form-panel"><div class="panel-head"><div><h2>注册外部 vLLM</h2><p>只监控，不会停止外部进程</p></div></div>
+              <label>显示名称<input v-model="externalForm.name" /></label>
+              <label>Base URL<input v-model="externalForm.base_url" placeholder="http://127.0.0.1:8001/v1" /></label>
+              <label>服务模型名（可空=取第一个）<input v-model="externalForm.served_name" /></label>
+              <label>接口类型<select v-model="externalForm.api_mode"><option value="completion">Completion</option><option value="chat">Chat</option></select></label>
+              <button class="secondary wide" @click="registerExternal">注册并监控</button>
+              <p class="tip">会调用外部 /v1/models 验证；外部服务的 stop/restart 接口返回 409。</p>
             </div>
           </div>
         </template>
@@ -368,7 +567,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
                 <p class="tip">离线批量模式需要后端环境安装 vllm；Prompt 仍是每个样本独立生成，不会拼接函数。</p>
               </template>
               <div class="field-label">优化等级</div><div class="check-row"><label v-for="o in ['O0','O1','O2','O3']" :key="o" class="check"><input type="checkbox" :checked="runForm.optimizations.includes(o)" @change="toggleOpt(o)"/>{{o}}</label></div>
-              <div class="two-inputs"><label>样本数量上限（0=全部）<input v-model.number="runForm.sample_limit" type="number" min="0" max="12000" /></label><label>最大 Token 数<input v-model.number="runForm.max_tokens" type="number" min="128" max="8192" /></label></div>
+              <div class="two-inputs"><label>样本数量上限（0=全部）<input v-model.number="runForm.sample_limit" type="number" min="0" max="100000" /></label><label>最大 Token 数<input v-model.number="runForm.max_tokens" type="number" min="128" max="8192" /></label></div>
               <div class="two-inputs"><label>推理并发数（0=AUTO）<input v-model.number="runForm.inference_concurrency" type="number" min="0" max="512" title="0 = AUTO 自适应持续投递" /></label><label>编译并发数<input v-model.number="runForm.compile_concurrency" type="number" min="1" max="128" /></label></div>
               <label>Prompt 模板<textarea v-model="runForm.prompt_template" rows="5"></textarea></label>
               <p class="tip">使用 <code>{assembly}</code> 占位符。不能向模型输入参考 C 代码或测试用例。推理与编译并发数受服务端上限约束。</p>
@@ -430,7 +629,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               <p v-if="selectedRun.run.config?.reference" class="tip"><b>参考源码基线任务：</b>失败代表数据集或评测环境问题，不能当作模型错误，也不能从模型 RE 分母中删除。</p>
               <p v-if="bottleneckText" class="tip"><b>瓶颈提示：</b>{{bottleneckText}}</p>
               <p v-if="selectedRun.run.error" class="danger-text">{{selectedRun.run.error}}</p>
-              <div class="score-grid"><div v-for="score in [{name:'RC · 编译率',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'TCP micro · 用例加权',value:selectedRun.metrics.tcp_micro},{name:'TCP macro · 函数平均',value:selectedRun.metrics.tcp_macro}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
+              <div class="score-grid"><div v-for="score in [{name:selectedRun.metrics.rc_mode==='official_source_compile'?'RC · 源码编译率（官方）':'RC · 编译率（旧口径）',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'ES · 编辑相似度',value:selectedRun.metrics.edit_similarity},{name:'TCP micro · 用例加权',value:selectedRun.metrics.tcp_micro},{name:'TCP macro · 函数平均',value:selectedRun.metrics.tcp_macro}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
               <p class="tip">可统计样本 {{selectedRun.metrics.evaluated}} 个，基础设施/推理错误排除 {{selectedRun.metrics.excluded}} 个。RE 为官方完整 harness 全部通过的样本比例；TCP micro = 通过原子用例/有效原子用例，TCP macro = 每个可诊断函数通过率的平均。metric {{selectedRun.metrics.metric_version || 'legacy'}}。
                 <span v-if="selectedRun.metrics.tcp_micro === null || selectedRun.metrics.tcp_micro === undefined"> 旧结果没有逐用例信息，TCP=N/A，需重新诊断评测。</span></p>
               <div class="progress-meta case-metrics">
@@ -438,6 +637,9 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
                 <span>case 覆盖 <b>{{selectedRun.metrics.cases_passed || 0}} / {{selectedRun.metrics.cases_total || 0}}</b></span>
                 <span>声明用例 <b>{{selectedRun.metrics.cases_declared || 0}}</b></span>
                 <span>覆盖率 <b>{{selectedRun.metrics.case_coverage === null || selectedRun.metrics.case_coverage === undefined ? 'N/A' : percent(selectedRun.metrics.case_coverage)}}</b></span>
+                <span>RC 口径 <b>{{selectedRun.metrics.rc_mode==='official_source_compile'?'官方：候选函数单独编译':'旧结果：候选+harness 整体编译'}}</b></span>
+                <span>Harness 整体编译率 <b>{{percent(selectedRun.metrics.rc_harness)}}</b></span>
+                <span>编辑相似度 <b>{{percent(selectedRun.metrics.edit_similarity)}}</b><small v-if="selectedRun.metrics.edit_similarity_samples"> · {{selectedRun.metrics.edit_similarity_samples}} 个样本</small></span>
                 <span>不可诊断样本 <b>{{selectedRun.metrics.unsupported_samples || 0}}</b></span>
                 <span>未覆盖用例 <b>{{selectedRun.metrics.uncovered_cases || 0}}</b></span>
                 <span>官方 RE 分母 <b>{{selectedRun.metrics.official_re_denominator ?? '—'}}</b></span>
@@ -448,7 +650,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
               <h3>不同优化等级</h3><div class="opt-cards"><div v-for="(item,opt) in selectedRun.by_optimization" :key="opt" class="opt-card"><strong>{{opt}}</strong><small>{{item.evaluated}} 个有效样本</small><div>RC <b>{{percent(item.rc)}}</b></div><div>RE <b>{{percent(item.re)}}</b></div></div></div>
             </div>
             <div class="panel"><div class="panel-head"><div><h2>样本级评测结果</h2><p>点击查看源代码、模型输出、编译和运行日志</p></div></div>
-              <div class="table-wrap"><table><thead><tr><th>样本 ID</th><th>优化</th><th>编译</th><th>官方测试</th><th>诊断用例</th><th>状态</th><th>诊断状态</th><th>耗时(推/编/测)</th><th></th></tr></thead><tbody><tr v-for="x in selectedRun.results" :key="x.id"><td class="mono">{{x.sample_key}}</td><td>{{x.optimization}}</td><td>{{x.compile_success===null?'—':x.compile_success?'✓':'✕'}}</td><td>{{x.tests_passed}} / {{x.tests_total}}</td><td>{{x.cases_passed||0}} / {{x.cases_total||0}} <small>({{x.cases_declared||0}})</small></td><td><span class="tag" :class="x.status">{{statusText(x.status)}}</span></td><td><span class="tag">{{x.test_case_status || '—'}}</span></td><td>{{x.inference_ms||0}} / {{x.compile_ms||0}} / {{x.test_ms||0}} ms</td><td><button class="ghost" @click="showResult(x.id)">查看 →</button></td></tr><tr v-if="!selectedRun.results.length"><td colspan="9" class="empty">尚无已完成样本</td></tr></tbody></table></div>
+              <div class="table-wrap"><table><thead><tr><th>样本 ID</th><th>优化</th><th>源码 / 整体编译</th><th>编辑相似度</th><th>官方测试</th><th>诊断用例</th><th>状态</th><th>诊断状态</th><th>耗时(推/编/测)</th><th></th></tr></thead><tbody><tr v-for="x in selectedRun.results" :key="x.id"><td class="mono">{{x.sample_key}}</td><td>{{x.optimization}}</td><td><span :title="'候选函数单独编译（官方 RC）'">{{x.source_compile_ok===null||x.source_compile_ok===undefined?'—':(x.source_compile_ok?'✓':'✕')}}</span><small v-if="x.source_compile_ok!==null&&x.source_compile_ok!==undefined"> / harness {{x.compile_success===null?'—':(x.compile_success?'✓':'✕')}}</small><small v-if="x.compile_stage" class="tip"> ({{x.compile_stage}})</small></td><td>{{x.edit_similarity===null||x.edit_similarity===undefined?'—':percent(x.edit_similarity*100)}}</td><td>{{x.tests_passed}} / {{x.tests_total}}</td><td>{{x.cases_passed||0}} / {{x.cases_total||0}} <small>({{x.cases_declared||0}})</small></td><td><span class="tag" :class="x.status">{{statusText(x.status)}}</span></td><td><span class="tag">{{x.test_case_status || '—'}}</span></td><td>{{x.inference_ms||0}} / {{x.compile_ms||0}} / {{x.test_ms||0}} ms</td><td><button class="ghost" @click="showResult(x.id)">查看 →</button></td></tr><tr v-if="!selectedRun.results.length"><td colspan="10" class="empty">尚无已完成样本</td></tr></tbody></table></div>
             </div>
           </div>
         </template>
@@ -459,7 +661,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
             <div class="compare-picker"><label v-for="r in completedRuns" :key="r.id" class="compare-chip"><input type="checkbox" :checked="compareIds.includes(r.id)" @change="toggleCompare(r.id)"/><span>#{{r.id}} · {{r.model_name}}</span></label><p v-if="!completedRuns.length" class="empty">尚无可比较的已完成评测任务。</p></div>
           </div>
           <div v-if="comparisons.length" class="panel"><div class="panel-head"><div><h2>性能对比</h2><p>各指标以百分比展示，N/A 表示无有效样本</p></div></div>
-            <div class="comparison-bars"><div v-for="r in comparisons" :key="r.id" class="comparison-row"><div class="comparison-name">{{r.model}} <small>Run #{{r.id}} · {{r.evaluated}} 样本</small></div><div class="bar-lines"><div class="bar-row"><span>RC</span><div class="bar-track"><i :style="{width:rate(r.rc)+'%',background:'#367dd6'}"></i></div><strong>{{percent(r.rc)}}</strong></div><div class="bar-row"><span>RE</span><div class="bar-track"><i :style="{width:rate(r.re)+'%',background:'#18a78e'}"></i></div><strong>{{percent(r.re)}}</strong></div><div class="bar-row"><span>TCP</span><div class="bar-track"><i :style="{width:rate(r.tcp)+'%',background:'#8c68cf'}"></i></div><strong>{{percent(r.tcp)}}</strong></div></div></div></div>
+            <div class="comparison-bars"><div v-for="r in comparisons" :key="r.id" class="comparison-row"><div class="comparison-name">{{r.model}} <small>Run #{{r.id}} · {{r.evaluated}} 样本</small></div><div class="bar-lines"><div class="bar-row"><span>RC</span><div class="bar-track"><i :style="{width:rate(r.rc)+'%',background:'#367dd6'}"></i></div><strong>{{percent(r.rc)}}</strong></div><div class="bar-row"><span>RE</span><div class="bar-track"><i :style="{width:rate(r.re)+'%',background:'#18a78e'}"></i></div><strong>{{percent(r.re)}}</strong></div><div class="bar-row"><span>ES</span><div class="bar-track"><i :style="{width:rate(r.edit_similarity)+'%',background:'#d08a35'}"></i></div><strong>{{percent(r.edit_similarity)}}</strong></div><div class="bar-row"><span>TCP</span><div class="bar-track"><i :style="{width:rate(r.tcp)+'%',background:'#8c68cf'}"></i></div><strong>{{percent(r.tcp)}}</strong></div></div></div></div>
             <p class="tip">相同数据集不一定意味着公平对比：请同时核对样本范围、Prompt、模型输入和评测器版本。</p>
           </div>
         </template>
@@ -474,6 +676,9 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
         <span>总耗时 <b>{{selectedResult.latency_ms||0}} ms</b></span>
         <span>Token <b>{{selectedResult.prompt_tokens||0}} / {{selectedResult.completion_tokens||0}}</b></span>
         <span>Harness <b>{{selectedResult.harness_mode==='program'?'完整程序（Test 0 = 整套一次执行）':'独立用例'}}</b></span>
+        <span>RC 阶段 <b>{{selectedResult.compile_stage || '—'}}</b></span>
+        <span>源码编译 <b>{{selectedResult.source_compile_ok===null||selectedResult.source_compile_ok===undefined?'—':(selectedResult.source_compile_ok?'通过':'失败')}}</b></span>
+        <span>编辑相似度 <b>{{selectedResult.edit_similarity===null||selectedResult.edit_similarity===undefined?'—':percent(selectedResult.edit_similarity*100)}}</b></span>
       </div>
       <div class="modal-meta" v-if="selectedResult.submitted_at || selectedResult.compile_started_at">
         <span v-if="selectedResult.submitted_at">提交 <b>{{dateTime(selectedResult.submitted_at)}}</b></span>
@@ -524,11 +729,17 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller)})
         <div v-for="t in selectedResult.tests_detail" :key="t.index" class="test-row">
           <div class="test-head"><strong>Test {{t.index}}</strong><span class="tag" :class="testTagClass(t.status)">{{testStatusText(t.status)}}</span><span>exit={{t.exit_code ?? '—'}} · signal={{t.signal_name || '—'}} · {{t.duration_ms}} ms</span><span v-if="t.timed_out" class="tag TIMEOUT">超时</span></div>
           <p v-if="t.reason" class="tip">{{t.reason}}</p>
+          <div v-if="t.expected_output !== undefined" class="exebench-io">
+            <div><b>输入</b><pre>{{jsonText(t.input)}}</pre></div>
+            <div><b>期望输出</b><pre>{{jsonText(t.expected_output)}}</pre></div>
+            <div><b>实际输出</b><pre>{{jsonText(t.actual_output)}}</pre></div>
+          </div>
           <details v-if="t.stdout || t.stderr"><summary>stdout / stderr</summary><pre v-if="t.stdout">[stdout]{{'\n'}}{{t.stdout}}</pre><pre v-if="t.stderr">[stderr]{{'\n'}}{{t.stderr}}</pre></details>
         </div>
       </div>
       <div class="logs"><div><h3>编译日志（stdout/stderr）</h3><pre>{{selectedResult.compile_log || '(无编译输出)'}}</pre></div><div><h3>测试汇总日志</h3><pre>{{selectedResult.run_log || '(无运行日志)'}}</pre></div></div>
       <p class="tip">测试通过 {{selectedResult.tests_passed}} / {{selectedResult.tests_total}}。exit=134 且 signal=SIGABRT 只有在捕获到断言失败信息时才按 WRONG_ANSWER 计；abort/堆损坏/段错误归为 RUNTIME_ERROR。</p>
     </div></div>
+    <div v-if="deployLogs!==null" class="modal-backdrop" @click.self="deployLogs=null"><div class="modal"><div class="modal-head"><div><span class="eyebrow">DEPLOY LOG</span><h2>部署 #{{deployLogId}} 启动日志</h2></div><button class="modal-close" @click="deployLogs=null">×</button></div><pre class="deploy-log">{{deployLogs}}</pre></div></div>
   </div>
 </template>
