@@ -140,6 +140,9 @@ def test_command_is_argv_without_shell(tmp_path, monkeypatch, no_gpu):
     assert captured['kwargs']['shell'] is False
     assert '--tensor-parallel-size' in captured['args']
     assert captured['kwargs']['env']['CUDA_VISIBLE_DEVICES'] == '0,1'
+    assert captured['kwargs']['env']['VLLM_BATCH_INVARIANT'] == '1'
+    assert '--seed' in captured['args']
+    assert '--no-enable-prefix-caching' in captured['args']
     assert captured['args'][0] == '/bin/true'
 
 
@@ -364,3 +367,30 @@ def test_cancel_api_requires_admin(monkeypatch, no_gpu):
         response = client.delete('/api/deployments/1', headers={'X-Admin-Token': 'secret'})
         assert response.status_code == 200
         assert called == [1]
+
+
+def test_deterministic_deployment_flags_are_configurable(tmp_path, monkeypatch, no_gpu):
+    monkeypatch.setattr(deployments, 'VLLM_BIN', '/bin/true')
+    monkeypatch.setattr(deployments, '_watch_start', lambda deployment_id: None)
+    captured = {}
+
+    def fake_popen(args, **kwargs):
+        captured['args'] = args
+        captured['kwargs'] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(deployments.subprocess, 'Popen', fake_popen)
+    row = deployments.start_deployment(payload(
+        tmp_path, deterministic=False, seed=42,
+        disable_prefix_caching=False, enforce_eager=True))
+    assert row['deterministic'] == 0 and row['seed'] == 42
+    assert row['disable_prefix_caching'] == 0 and row['enforce_eager'] == 1
+    args = captured['args']
+    assert args[args.index('--seed') + 1] == '42'
+    assert '--no-enable-prefix-caching' not in args
+    assert '--enforce-eager' in args
+    assert 'VLLM_BATCH_INVARIANT' not in captured['kwargs']['env']
+    # Restart reuses the persisted deterministic parameters.
+    monkeypatch.setattr(deployments, '_pid_alive', lambda pid: False)
+    again = deployments.restart_deployment(row['id'])
+    assert again['seed'] == 42 and again['enforce_eager'] == 1

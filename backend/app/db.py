@@ -127,6 +127,10 @@ def initialize():
           max_num_seqs INTEGER NOT NULL,
           max_num_batched_tokens INTEGER NOT NULL,
           gpu_memory_utilization REAL NOT NULL,
+          deterministic INTEGER NOT NULL DEFAULT 0,
+          seed INTEGER NOT NULL DEFAULT 0,
+          disable_prefix_caching INTEGER NOT NULL DEFAULT 0,
+          enforce_eager INTEGER NOT NULL DEFAULT 0,
           api_mode TEXT NOT NULL DEFAULT 'completion',
           managed INTEGER NOT NULL DEFAULT 1,
           base_url TEXT NOT NULL DEFAULT '',
@@ -222,6 +226,13 @@ def initialize():
         _ensure_column(db, 'models', 'deployment_id', 'INTEGER')
         db.execute('CREATE INDEX IF NOT EXISTS idx_models_deployment ON models(deployment_id)')
         # Automatic, additive migration for existing evaluation databases.
+        for column, ddl in (
+            ('deterministic', 'INTEGER NOT NULL DEFAULT 0'),
+            ('seed', 'INTEGER NOT NULL DEFAULT 0'),
+            ('disable_prefix_caching', 'INTEGER NOT NULL DEFAULT 0'),
+            ('enforce_eager', 'INTEGER NOT NULL DEFAULT 0'),
+        ):
+            _ensure_column(db, 'deployments', column, ddl)
         _ensure_column(db, 'runs', 'started_at', 'TEXT')
         for column, ddl in (
             ('inference_ms', 'INTEGER NOT NULL DEFAULT 0'),

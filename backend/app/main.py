@@ -15,11 +15,12 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Query, Respo
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import ValidationError
 from .config import (DATA_DIR, CORS_ORIGINS, MAX_UPLOAD_BYTES, MAX_DATASET_UPLOAD_BYTES, MAX_SAMPLES,
-                     INFERENCE_CONCURRENCY, COMPILE_CONCURRENCY, COMPILE_TIMEOUT, TEST_TIMEOUT, LOG_LIMIT_BYTES, MAX_MODEL_LEN,
+                     SERVER_IMPORT_DIRS,
+                     INFERENCE_CONCURRENCY, COMPILE_CONCURRENCY, COMPILE_TIMEOUT, TEST_TIMEOUT, LOG_LIMIT_BYTES, MAX_MODEL_LEN, ALLOW_HOST_EXECUTION,
                      OFFLINE_BATCH_SIZE, VLLM_METRICS_ENABLED)
 from .db import connect, initialize, seed_demo, now
 from .schemas import (ModelCreate, RunCreate, ReferenceCheckCreate, BatchRunCreate,
-                     DeploymentCreate, ExternalDeploymentCreate)
+                     DeploymentCreate, ExternalDeploymentCreate, ServerDatasetImport)
 from .worker import submit_run, get_progress, clear_progress, REFERENCE_MODEL_NAME
 from .adapters import OfflineBatchAdapter, fetch_vllm_metrics
 from .sandbox import extract_c
@@ -29,6 +30,7 @@ from . import deployments as deploy_service
 from . import gpu as gpu_service
 from .deployments import DeploymentError
 from .edit_sim import backfill_edit_similarity
+from .host_sandbox import host_toolchain
 
 EXCLUDED={'INFRA_ERROR','INFERENCE_ERROR','ORACLE_ERROR','INVALID_BENCHMARK'}
 # Rows that exist before the sample reaches a final state are never counted in
@@ -244,7 +246,8 @@ def _read_jsonl(raw:bytes):
 
 @app.get('/api/health')
 def health():
-    return {'ok':True,'version':'0.6.0','sandbox':'docker-required','pipeline':'async'}
+    return {'ok':True,'version':'0.6.0','sandbox':'docker-required','pipeline':'async',
+            'allow_host_execution':ALLOW_HOST_EXECUTION}
 
 @app.get('/api/overview')
 def overview():
@@ -278,8 +281,81 @@ def datasets():
             rows.append(item)
         return rows
 
+def _server_roots() -> list[Path]:
+    roots=[]
+    for root in SERVER_IMPORT_DIRS:
+        try: roots.append(Path(root).expanduser().resolve())
+        except OSError: continue
+    return roots
+
+
+def _resolve_server_file(raw: str) -> Path:
+    text=str(raw or '').strip()
+    if not text:
+        raise HTTPException(422,'服务器文件路径为空')
+    roots=_server_roots()
+    candidate=Path(text).expanduser()
+    candidates=[candidate] if candidate.is_absolute() else [root/candidate for root in roots]
+    for item in candidates:
+        try:
+            resolved=item.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.suffix.lower()!='.jsonl':
+            raise HTTPException(422,'只允许导入 .jsonl 文件')
+        if not any(resolved==root or resolved.is_relative_to(root) for root in roots):
+            raise HTTPException(403,'文件路径不在允许的服务器导入目录内')
+        if not resolved.is_file():
+            raise HTTPException(422,'服务器路径不是文件')
+        return resolved
+    raise HTTPException(404,'服务器文件不存在')
+
+
+@app.get('/api/datasets/server-files')
+def dataset_server_files(limit:int=Query(500,ge=1,le=2000)):
+    roots=_server_roots()
+    files=[]
+    for root in roots:
+        if not root.is_dir(): continue
+        try:
+            entries=list(root.rglob('*.jsonl'))
+        except OSError:
+            continue
+        for path in entries:
+            try:
+                resolved=path.resolve(strict=True)
+            except OSError:
+                continue
+            if not resolved.is_file() or not resolved.is_relative_to(root):
+                continue
+            try: stat=resolved.stat()
+            except OSError: continue
+            files.append({'path':str(resolved),'relative':str(resolved.relative_to(root)),
+                          'root':str(root),'name':resolved.name,'size':stat.st_size,
+                          'modified':stat.st_mtime})
+    files.sort(key=lambda x:x['modified'], reverse=True)
+    return {'directories':[str(r) for r in roots], 'files':files[:limit]}
+
+
+@app.post('/api/datasets/import-server',status_code=201)
+async def import_dataset_from_server(body:ServerDatasetImport):
+    path=_resolve_server_file(body.path)
+    try:
+        with path.open('rb') as fp:
+            upload=UploadFile(file=fp, filename=path.name, size=path.stat().st_size)
+            result=await _import_dataset_source(body.name,body.version,body.description,upload)
+            result['source_path']=str(path)
+            return result
+    except OSError as exc:
+        raise HTTPException(422,f'无法读取服务器文件: {exc}') from exc
+
+
 @app.post('/api/datasets/import',status_code=201)
 async def import_dataset(name:str=Form(...),version:str=Form('v1'),description:str=Form(''),file:UploadFile=File(...)):
+    return await _import_dataset_source(name,version,description,file)
+
+
+async def _import_dataset_source(name:str,version:str,description:str,file:UploadFile):
     if not name.strip() or len(name)>100 or len(version)>40:
         raise HTTPException(422,'Invalid dataset name/version')
     if not file.filename or not file.filename.lower().endswith('.jsonl'):
@@ -483,6 +559,31 @@ def _select_samples(db, dataset_id:int, opts:list[str], limit:int):
         args.append(limit)
     return list(db.execute(q,args))
 
+def _validate_execution_mode(body, dataset):
+    mode=str(getattr(body, 'execution_mode', 'docker') or 'docker')
+    if mode == 'host':
+        if not ALLOW_HOST_EXECUTION:
+            raise HTTPException(403,'Host execution is disabled by DEC_EVAL_ALLOW_HOST_EXECUTION')
+        if not getattr(body, 'host_execution_ack', False):
+            raise HTTPException(422,'Host execution requires host_execution_ack=true')
+        with connect() as db:
+            exebench=db.execute("SELECT COUNT(*) FROM samples WHERE dataset_id=? "
+                                "AND test_protocol LIKE 'exebench%'",(dataset['id'],)).fetchone()[0]
+        if exebench:
+            raise HTTPException(422,'ExeBench datasets require the Docker execution mode')
+        toolchain=host_toolchain()
+        if not toolchain['available']:
+            raise HTTPException(503,'Host compiler is unavailable: ' +
+                                (toolchain['cc'].get('error') or toolchain['cxx'].get('error') or 'unknown'))
+        return toolchain
+    return None
+
+
+@app.get('/api/host-toolchain')
+def get_host_toolchain():
+    return host_toolchain()
+
+
 @app.post('/api/runs',status_code=201)
 def create_run(body:RunCreate):
     with connect() as db:
@@ -495,7 +596,10 @@ def create_run(body:RunCreate):
         samples=_select_samples(db,body.dataset_id,body.optimizations,body.sample_limit)
         if not samples:
             raise HTTPException(422,'No samples match the selected conditions')
+        host_toolchain_snapshot=_validate_execution_mode(body,dataset)
         cfg=body.model_dump()
+        if host_toolchain_snapshot:
+            cfg['host_toolchain']=host_toolchain_snapshot
         cfg['inference_concurrency']=(body.inference_concurrency
                                       if body.inference_concurrency is not None
                                       else INFERENCE_CONCURRENCY)
@@ -577,7 +681,10 @@ def create_batch_run(body:BatchRunCreate):
         samples=_select_samples(db,body.dataset_id,body.optimizations,body.sample_limit)
         if not samples:
             raise HTTPException(422,'No samples match the selected conditions')
+        host_toolchain_snapshot=_validate_execution_mode(body,dataset)
         cfg=body.model_dump()
+        if host_toolchain_snapshot:
+            cfg['host_toolchain']=host_toolchain_snapshot
         cfg['generation_mode']='offline_batch'
         cfg['model_path']=model_path
         cfg['batch_size']=body.batch_size or OFFLINE_BATCH_SIZE

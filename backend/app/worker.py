@@ -45,6 +45,7 @@ from .adapters import (
     OnlineAdapter, post_with_retries as _post_with_retries,
 )
 from .sandbox import EvalOutcome, evaluate_code_async, extract_c
+from .host_sandbox import evaluate_code_host_async
 from .exebench import evaluate_exebench_async, diff_io
 from .edit_sim import edit_similarity
 
@@ -841,7 +842,8 @@ async def _ensure_exebench_oracle(sample: dict) -> bool:
 
 async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms: int,
                        diagnostics: dict | None = None,
-                       submitted_at: str = '', generated_at: str = '') -> None:
+                       submitted_at: str = '', generated_at: str = '',
+                       execution_mode: str = 'docker') -> None:
     tests = json.loads(sample['tests_json'])
     info = (diagnostics or {}).get(sample['id']) or {'status': 'DISABLED', 'manifest': {}}
     compile_started_at = now()
@@ -861,6 +863,11 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
                     language=sample.get('language') or 'c',
                     compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
                     log_limit=LOG_LIMIT_BYTES)
+        elif execution_mode == 'host':
+            outcome = await evaluate_code_host_async(
+                prediction, sample['dependencies'], tests, language=sample['language'],
+                compile_timeout=COMPILE_TIMEOUT, test_timeout=TEST_TIMEOUT,
+                log_limit=LOG_LIMIT_BYTES, diagnostic=info.get('diagnostic'))
         else:
             outcome = await evaluate_code_async(
                 prediction, sample['dependencies'], tests, language=sample['language'],
@@ -905,7 +912,8 @@ async def _compile_one(run_id: int, sample: dict, prediction: str, inference_ms:
 
 async def _compile_worker(run_id: int, queue: asyncio.Queue,
                           cancel_event: asyncio.Event,
-                          diagnostics: dict | None = None) -> None:
+                          diagnostics: dict | None = None,
+                          execution_mode: str = 'docker') -> None:
     while True:
         item = await queue.get()
         try:
@@ -916,7 +924,7 @@ async def _compile_worker(run_id: int, queue: asyncio.Queue,
             sample, prediction, inference_ms, submitted_at, generated_at = item
             _progress_patch(run_id, waiting_compile=-1, compiling=1)
             await _compile_one(run_id, sample, prediction, inference_ms, diagnostics,
-                               submitted_at, generated_at)
+                               submitted_at, generated_at, execution_mode=execution_mode)
         finally:
             queue.task_done()
 
@@ -1123,6 +1131,7 @@ async def _evaluate_run(run_id: int) -> None:
         'compile_concurrency_requested': compile_requested,
         'max_pending_compile': max_pending,
         'generation_mode': 'offline_batch' if batch_mode else 'online',
+        'execution_mode': cfg.get('execution_mode', 'docker'),
         'batch_size': batch_size if batch_mode else 0,
         'max_model_len': int(cfg.get('max_model_len') or MAX_MODEL_LEN),
         'prompt_tokens': prompt_tokens,
@@ -1164,7 +1173,8 @@ async def _evaluate_run(run_id: int) -> None:
 
     for _ in range(compile_conc):
         compile_tasks.append(asyncio.create_task(
-            _compile_worker(run_id, compile_queue, cancel_event, diagnostics)))
+            _compile_worker(run_id, compile_queue, cancel_event, diagnostics,
+                            execution_mode=cfg.get('execution_mode', 'docker'))))
     watchdog = asyncio.create_task(_watch_cancel(run_id, cancel_event, active_inference))
     client: httpx.AsyncClient | None = None
     tokenizer_client: httpx.AsyncClient | None = None

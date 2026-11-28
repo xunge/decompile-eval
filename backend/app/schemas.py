@@ -45,6 +45,8 @@ class RunCreate(_OptimizationMixin):
     # authoritative unless the client explicitly overrides it.
     inference_concurrency: int | None = Field(default=None, ge=0, le=MAX_INFERENCE_CONCURRENCY)
     compile_concurrency: int | None = Field(default=None, ge=1, le=MAX_COMPILE_CONCURRENCY)
+    execution_mode: Literal['docker', 'host'] = 'docker'
+    host_execution_ack: bool = False
 
 
 class ReferenceCheckCreate(_OptimizationMixin):
@@ -69,6 +71,10 @@ class DeploymentCreate(BaseModel):
     max_num_seqs: int = Field(default=64, ge=1, le=4096)
     max_num_batched_tokens: int = Field(default=8192, ge=1, le=1_000_000)
     gpu_memory_utilization: float = Field(default=0.7, ge=0.05, le=0.99)
+    deterministic: bool = True
+    seed: int = Field(default=0, ge=0, le=2_147_483_647)
+    disable_prefix_caching: bool = True
+    enforce_eager: bool = False
     api_mode: Literal['completion', 'chat'] = 'completion'
 
 
@@ -77,3 +83,10 @@ class ExternalDeploymentCreate(BaseModel):
     base_url: str = Field(min_length=7, max_length=500)
     served_name: str = Field(default='', max_length=100)
     api_mode: Literal['completion', 'chat'] = 'completion'
+
+
+class ServerDatasetImport(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    version: str = Field(default='v1', max_length=40)
+    description: str = Field(default='', max_length=1000)
+    path: str = Field(min_length=1, max_length=2000)

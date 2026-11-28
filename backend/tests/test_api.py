@@ -375,3 +375,62 @@ def test_reference_model_cannot_be_deleted():
         assert client.delete(f'/api/models/{mid}').status_code == 403
         with connect() as db:
             db.execute('DELETE FROM models WHERE id=?', (mid,))
+
+
+def test_server_file_listing_and_import(tmp_path, monkeypatch):
+    import app.main as main_module
+    root = tmp_path / 'server-imports'; root.mkdir()
+    (root / 'valid.jsonl').write_text(json.dumps({
+        'sample_id': 'server-sample',
+        'assembly': 'func0:\n ret',
+        'reference_source': 'int func0(void){return 0;}',
+        'tests': [{'code': 'if (func0()!=0) return 1;'}],
+    }) + '\n', encoding='utf-8')
+    (root / 'not-jsonl.txt').write_text('{}', encoding='utf-8')
+    monkeypatch.setattr(main_module, 'SERVER_IMPORT_DIRS', [root])
+    with TestClient(app) as client:
+        listing = client.get('/api/datasets/server-files')
+        assert listing.status_code == 200
+        files = listing.json()['files']
+        assert any(f['relative'] == 'valid.jsonl' for f in files)
+        assert all(f['name'].endswith('.jsonl') for f in files)
+        response = client.post('/api/datasets/import-server', json={
+            'name': 'Server file dataset', 'version': 'v1',
+            'description': '', 'path': 'valid.jsonl'})
+        assert response.status_code == 201, response.text
+        assert response.json()['sample_count'] == 1
+        assert response.json()['source_path'] == str((root / 'valid.jsonl').resolve())
+        did = response.json()['dataset_id']
+        assert client.delete(f'/api/datasets/{did}').status_code == 200
+        # Absolute paths outside the allow-list are rejected.
+        assert client.post('/api/datasets/import-server', json={
+            'name': 'Blocked', 'path': '/etc/passwd'}).status_code in (403, 422)
+        # Path traversal is rejected.
+        assert client.post('/api/datasets/import-server', json={
+            'name': 'Blocked', 'path': '../outside.jsonl'}).status_code in (403, 404)
+
+
+def test_host_execution_requires_server_switch_and_ack(monkeypatch):
+    import app.main as main_module
+    with TestClient(app) as client:
+        ds = client.get('/api/datasets').json()[0]
+        model = client.get('/api/models').json()[0]
+        body = {'dataset_id': ds['id'], 'model_id': model['id'], 'sample_limit': 1,
+                'execution_mode': 'host', 'host_execution_ack': True}
+        monkeypatch.setattr(main_module, 'ALLOW_HOST_EXECUTION', False)
+        assert client.post('/api/runs', json=body).status_code == 403
+        monkeypatch.setattr(main_module, 'ALLOW_HOST_EXECUTION', True)
+        assert client.post('/api/runs', json={**body, 'host_execution_ack': False}).status_code == 422
+        assert client.get('/api/health').json()['allow_host_execution'] is True
+
+
+def test_host_toolchain_endpoint_reports_gcc_version():
+    with TestClient(app) as client:
+        response = client.get('/api/host-toolchain')
+        assert response.status_code == 200
+        data = response.json()
+        assert data['engine'] == 'host'
+        assert 'cc_version' in data and 'cxx_version' in data
+        if data['available']:
+            assert data['cc_version']
+            assert data['cc']['path']

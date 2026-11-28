@@ -23,8 +23,13 @@ const compareIds = ref([])
 const uploadFile = ref(null)
 const offlineFile = ref(null)
 const datasetForm = ref({name:'自定义数据集',version:'v1',description:''})
+const importMode = ref('local')
+const serverFiles = ref([])
+const serverDirs = ref([])
+const serverFile = ref('')
+const hostToolchain = ref(null)
 const modelForm = ref({name:'',kind:'openai',base_url:'http://127.0.0.1:8001/v1',api_model:'',api_mode:'completion',api_key_env:'',system_prompt:'You are an expert binary decompiler. Output only valid C source code.'})
-const runForm = ref({dataset_id:null,model_id:null,optimizations:['O0','O1','O2','O3'],sample_limit:0,max_tokens:1024,temperature:0,inference_concurrency:0,compile_concurrency:64,generation_mode:'online',model_path:'',batch_size:32,prompt_template:'# This is the assembly code:\n{assembly}\n# What is the source code?\n'})
+const runForm = ref({dataset_id:null,model_id:null,optimizations:['O0','O1','O2','O3'],sample_limit:0,max_tokens:1024,temperature:0,inference_concurrency:0,compile_concurrency:64,generation_mode:'online',execution_mode:'docker',host_execution_ack:false,model_path:'',batch_size:32,prompt_template:'# This is the assembly code:\n{assembly}\n# What is the source code?\n'})
 const offlineForm = ref({dataset_id:null,name:'离线结果导入'})
 const deployments = ref([])
 const gpuData = ref({available:false,error:'',devices:[],sampled_at:''})
@@ -37,7 +42,8 @@ const deployForm = ref({
   model_path:'/home/jiang/share/model/llm4decompile-1.3b-v1.5',
   gpu_ids:'0', port:8002, dtype:'bfloat16', max_model_len:4096,
   max_num_seqs:64, max_num_batched_tokens:8192,
-  gpu_memory_utilization:0.7, api_mode:'completion'
+  gpu_memory_utilization:0.7, deterministic:true, seed:0,
+  disable_prefix_caching:true, enforce_eager:false, api_mode:'completion'
 })
 const externalForm = ref({name:'外部 vLLM',base_url:'http://127.0.0.1:8001/v1',served_name:'',api_mode:'completion'})
 
@@ -114,16 +120,44 @@ async function showDataset(d) {
     setPage('datasets')
   })
 }
+const formatBytes = n => n === null || n === undefined ? '—' : n >= 1048576 ? (n/1048576).toFixed(1)+' MB' : (n/1024).toFixed(1)+' KB'
+async function loadServerFiles() {
+  await safely(async()=>{
+    const data=await request('/datasets/server-files')
+    serverFiles.value=data.files || []
+    serverDirs.value=data.directories || []
+  })
+}
+function setExecutionMode(mode) {
+  runForm.value.execution_mode=mode
+  if(mode==='host') loadHostToolchain()
+}
+function setImportMode(mode) {
+  importMode.value=mode
+  if(mode==='server' && !serverFiles.value.length) loadServerFiles()
+}
+async function loadHostToolchain() {
+  try { hostToolchain.value=await request('/host-toolchain') }
+  catch(e) { hostToolchain.value={available:false,cc_version:'',cxx_version:'',cc:{error:'版本接口不可用'},cxx:{error:'版本接口不可用'}} }
+}
 async function uploadDataset() {
   await safely(async()=>{
-    if (!uploadFile.value) throw new Error('请先选择 .jsonl 文件')
-    const fd = new FormData()
-    for (const k of ['name','version','description']) fd.append(k,datasetForm.value[k])
-    fd.append('file',uploadFile.value)
-    const r=await request('/datasets/import',{method:'POST',body:fd})
+    let r
+    if(importMode.value==='local'){
+      if (!uploadFile.value) throw new Error('请先选择本地 .jsonl 文件')
+      const fd = new FormData()
+      for (const k of ['name','version','description']) fd.append(k,datasetForm.value[k])
+      fd.append('file',uploadFile.value)
+      r=await request('/datasets/import',{method:'POST',body:fd})
+    } else {
+      if(!serverFile.value) throw new Error('请先选择服务器上的 .jsonl 文件')
+      r=await request('/datasets/import-server',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({...datasetForm.value,path:serverFile.value})})
+    }
     await refresh()
     message.value=`成功导入 ${r.sample_count} 个样本（数据集 #${r.dataset_id}）`
-    uploadFile.value=null
+    uploadFile.value=null; serverFile.value=''
   })
 }
 async function deleteDataset(d) {
@@ -383,6 +417,7 @@ let poller, progressPoller, deployPoller
 onMounted(async()=>{
   await safely(refresh)
   if(active.value==='deploy'){await loadDeployments();await loadGpu()}
+  loadHostToolchain()
   poller=setInterval(async()=>{
     try {
       if(runs.value.some(r=>isActiveRun(r.status)) || active.value==='overview'){
@@ -459,9 +494,19 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
               <label>数据集名称<input v-model="datasetForm.name" placeholder="HumanEval-Decompile" /></label>
               <label>版本<input v-model="datasetForm.version" placeholder="v1" /></label>
               <label>说明<input v-model="datasetForm.description" placeholder="数据集介绍" /></label>
-              <label>选择 JSONL 文件<input type="file" accept=".jsonl" @change="uploadFile=$event.target.files[0]" /></label>
+              <div class="import-mode"><button :class="{active:importMode==='local'}" class="mode-btn" @click="setImportMode('local')">本地上传</button><button :class="{active:importMode==='server'}" class="mode-btn" @click="setImportMode('server')">服务器文件</button></div>
+              <div v-if="importMode==='local'" class="file-box">
+                <input id="dataset-local-file" type="file" accept=".jsonl" hidden @change="uploadFile=$event.target.files[0]" />
+                <label for="dataset-local-file" class="file-select">选择本地 JSONL</label>
+                <span class="file-meta">{{ uploadFile ? uploadFile.name : '未选择文件' }}</span>
+              </div>
+              <div v-else class="file-box server-file-box">
+                <div class="server-head"><span class="file-select" @click="loadServerFiles">刷新服务器列表 ↻</span><small v-if="serverDirs.length">允许目录：{{serverDirs.join(' · ')}}</small></div>
+                <select v-model="serverFile"><option value="">选择服务器上的 .jsonl</option><option v-for="f in serverFiles" :key="f.path" :value="f.path">{{ f.relative }} · {{formatBytes(f.size)}}</option></select>
+                <small v-if="!serverFiles.length" class="tip">允许目录下暂无 .jsonl 文件。</small>
+              </div>
               <button class="primary wide" :disabled="loading" @click="uploadDataset">导入数据集</button>
-              <p class="tip">默认不限制上传文件大小（最多 100000 条样本）；支持 C/C++，必须附带 tests。大文件会占用后端内存。</p>
+              <p class="tip">默认不限制上传文件大小（最多 100000 条样本）；支持 C/C++，必须附带 tests。服务器文件仅允许从配置目录中选择。</p>
             </div>
           </div>
         </template>
@@ -515,7 +560,7 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
                 <td><strong>{{d.name}}</strong><small class="mono">{{d.served_name}}</small><div class="tip mono">{{d.model_path || '(external)'}}</div></td>
                 <td><span class="tag" :class="deployTagClass(d.status)">{{deployStatusText(d.status)}}</span><small v-if="d.error" class="danger-text">{{d.error}}</small><small v-if="d.managed && d.pid"> PID {{d.pid}}</small></td>
                 <td class="mono">{{d.base_url}}</td>
-                <td>GPU {{d.gpu_ids || '—'}}<br><small>port {{d.port || '—'}} · {{d.dtype}} · {{d.gpu_memory_utilization}}</small></td>
+                <td>GPU {{d.gpu_ids || '—'}}<br><small>port {{d.port || '—'}} · {{d.dtype}} · {{d.gpu_memory_utilization}}</small><br><small v-if="d.deterministic">确定性 seed {{d.seed}} · {{d.disable_prefix_caching?'no-prefix-cache':'prefix-cache'}}</small></td>
                 <td><span v-if="d.metrics">运行 {{d.metrics.running ?? '—'}} / 等待 {{d.metrics.waiting ?? '—'}}</span><span v-else>—</span></td>
                 <td><small>入 {{d.metrics?.input_tokens_per_sec ?? '—'}} · 出 {{d.metrics?.output_tokens_per_sec ?? '—'}}</small></td>
                 <td><div class="actions"><button class="ghost" @click="showDeployLogs(d)" :disabled="!d.managed">日志</button><button class="ghost danger" v-if="d.managed && d.status!=='stopped'" @click="deployAction(d.id,'stop')">停止</button><button class="ghost" v-if="d.managed" @click="deployAction(d.id,'restart')">重启</button><button class="ghost danger" :title="d.managed?'停止并移除部署配置':'仅取消监控，不停止外部进程'" @click="cancelDeployment(d)">取消部署</button><span v-if="!d.managed" class="tip">外部</span></div></td>
@@ -538,10 +583,14 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
                 <label>max-num-batched-tokens<input v-model.number="deployForm.max_num_batched_tokens" type="number" /></label>
                 <label>gpu-memory-utilization<input v-model.number="deployForm.gpu_memory_utilization" type="number" step="0.05" min="0.05" max="0.99" /></label>
                 <label>接口类型<select v-model="deployForm.api_mode"><option value="completion">Completion</option><option value="chat">Chat</option></select></label>
+                <label>随机种子（seed）<input v-model.number="deployForm.seed" type="number" min="0" max="2147483647" /></label>
+                <label class="check-inline"><input v-model="deployForm.deterministic" type="checkbox" /> 确定性输出（VLLM_BATCH_INVARIANT）</label>
+                <label class="check-inline"><input v-model="deployForm.disable_prefix_caching" type="checkbox" /> 禁用 prefix caching</label>
+                <label class="check-inline"><input v-model="deployForm.enforce_eager" type="checkbox" /> enforce eager（更稳定、更慢）</label>
                 <label>管理令牌（可选）<input v-model="adminToken" type="password" placeholder="DEC_EVAL_ADMIN_TOKEN" @change="saveAdminToken" /></label>
               </div>
               <button class="primary wide" :disabled="deployBusy" @click="startDeployment">▶ 启动并注册模型</button>
-              <p class="tip">参数会持久化；后端重启后会通过 PID + /proc cmdline 校验并恢复对现存进程的管理。禁止使用 shell。</p>
+              <p class="tip">参数会持久化；后端重启后会通过 PID + /proc cmdline 校验并恢复对现存进程的管理。禁止使用 shell。确定性模式会设置 VLLM_BATCH_INVARIANT=1、--seed、禁用 prefix caching；仍建议评测使用 temperature=0。</p>
             </div>
             <div class="panel form-panel"><div class="panel-head"><div><h2>注册外部 vLLM</h2><p>只监控，不会停止外部进程</p></div></div>
               <label>显示名称<input v-model="externalForm.name" /></label>
@@ -561,6 +610,14 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
               <label>评测数据集<select v-model.number="runForm.dataset_id"><option v-for="d in datasets" :value="d.id" :key="d.id">{{d.name}}（{{d.sample_count}}）</option></select></label>
               <label>评测模型<select v-model.number="runForm.model_id"><option v-for="m in models" :value="m.id" :key="m.id" :disabled="m.kind==='offline'">{{m.name}}</option></select></label>
               <label>生成方式<select v-model="runForm.generation_mode"><option value="online">在线 HTTP（vLLM /v1/completions）</option><option value="offline_batch">离线批量（本地 vLLM LLM.generate）</option></select></label>
+              <label>编译执行环境<select :value="runForm.execution_mode" @change="setExecutionMode($event.target.value)"><option value="docker">Docker 沙箱（安全，默认）</option><option value="host">宿主机 gcc/g++ 快速（无隔离）</option></select></label>
+              <div v-if="runForm.execution_mode==='host'" class="host-toolchain">
+                <span>本地 GCC：<b>{{hostToolchain?.cc_version || hostToolchain?.cc?.error || '检测中…'}}</b></span>
+                <span>本地 G++：<b>{{hostToolchain?.cxx_version || hostToolchain?.cxx?.error || '检测中…'}}</b></span>
+                <span v-if="hostToolchain && !hostToolchain.available" class="danger-text">宿主机编译器不可用</span>
+              </div>
+              <label v-if="runForm.execution_mode==='host'" class="check"><input v-model="runForm.host_execution_ack" type="checkbox" /> 我确认在宿主机执行不可信代码，风险自负</label>
+              <p v-if="runForm.execution_mode==='host'" class="notice error">宿主机模式跳过 Docker 隔离和网络隔离，仅适用于可信本地环境。宿主机编译器版本会记录到任务配置中。</p>
               <template v-if="runForm.generation_mode==='offline_batch'">
                 <label>本地模型路径<input v-model="runForm.model_path" placeholder="/path/to/llm4decompile-1.3b-v1.5 或 HF id" /></label>
                 <label>批大小（独立 Prompt）<input v-model.number="runForm.batch_size" type="number" min="1" max="4096" /></label>
@@ -611,6 +668,8 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
               <div class="progress-meta">
                 <span>推理并发 <b>{{prog.inference_concurrency === 0 ? 'AUTO (0)' : (prog.inference_concurrency || '—')}}</b><small v-if="prog.auto_max_inflight"> · 当前上限 {{prog.auto_limit || '—'}} / {{prog.auto_max_inflight}}</small></span>
                 <span>编译并发 <b>{{prog.compile_concurrency || '—'}}</b><small v-if="prog.compile_concurrency_requested && prog.compile_concurrency_requested !== prog.compile_concurrency"> · 请求 {{prog.compile_concurrency_requested}}</small></span>
+                <span>执行环境 <b>{{prog.execution_mode==='host'?'宿主机快速':'Docker'}}</b></span>
+                <span v-if="prog.execution_mode==='host'">GCC 版本 <b>{{selectedRun.run.config?.host_toolchain?.cc_version || hostToolchain?.cc_version || '未记录'}}</b></span>
                 <span>在途请求 <b>{{prog.in_flight || 0}}</b></span>
                 <span>推理请求数 <b>{{prog.inference_requests || 0}}</b></span>
                 <span>推理吞吐 <b>{{fmtRate(prog.inference_rate)}}</b></span>
@@ -626,10 +685,11 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
                 <span v-if="prog.vllm_metrics">GPU 运行/等待 <b>{{prog.vllm_metrics.num_requests_running ?? '—'}} / {{prog.vllm_metrics.num_requests_waiting ?? '—'}}</b></span>
                 <span v-if="prog.vllm_metrics?.gpu_cache_usage_perc !== undefined">KV 缓存 <b>{{Math.round(prog.vllm_metrics.gpu_cache_usage_perc * 100)}}%</b></span>
               </div>
+              <p v-if="selectedRun.run.config?.execution_mode==='host'" class="notice error"><b>宿主机快速模式：</b>本任务未使用 Docker 隔离，仅适合可信本地实验。</p>
               <p v-if="selectedRun.run.config?.reference" class="tip"><b>参考源码基线任务：</b>失败代表数据集或评测环境问题，不能当作模型错误，也不能从模型 RE 分母中删除。</p>
               <p v-if="bottleneckText" class="tip"><b>瓶颈提示：</b>{{bottleneckText}}</p>
               <p v-if="selectedRun.run.error" class="danger-text">{{selectedRun.run.error}}</p>
-              <div class="score-grid"><div v-for="score in [{name:selectedRun.metrics.rc_mode==='official_source_compile'?'RC · 源码编译率（官方）':'RC · 编译率（旧口径）',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'ES · 编辑相似度',value:selectedRun.metrics.edit_similarity},{name:'TCP micro · 用例加权',value:selectedRun.metrics.tcp_micro},{name:'TCP macro · 函数平均',value:selectedRun.metrics.tcp_macro}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
+              <div class="score-grid"><div v-for="score in [{name:'RC · 编译率',value:selectedRun.metrics.rc},{name:'RE · 执行率',value:selectedRun.metrics.re},{name:'ES · 编辑相似度',value:selectedRun.metrics.edit_similarity},{name:'TCP micro · 用例加权',value:selectedRun.metrics.tcp_micro},{name:'TCP macro · 函数平均',value:selectedRun.metrics.tcp_macro}]" :key="score.name" class="score"><div class="score-title">{{score.name}}</div><strong>{{percent(score.value)}}</strong><div class="score-track"><span :style="{width:rate(score.value)+'%'}"></span></div></div></div>
               <p class="tip">可统计样本 {{selectedRun.metrics.evaluated}} 个，基础设施/推理错误排除 {{selectedRun.metrics.excluded}} 个。RE 为官方完整 harness 全部通过的样本比例；TCP micro = 通过原子用例/有效原子用例，TCP macro = 每个可诊断函数通过率的平均。metric {{selectedRun.metrics.metric_version || 'legacy'}}。
                 <span v-if="selectedRun.metrics.tcp_micro === null || selectedRun.metrics.tcp_micro === undefined"> 旧结果没有逐用例信息，TCP=N/A，需重新诊断评测。</span></p>
               <div class="progress-meta case-metrics">
@@ -637,8 +697,6 @@ onUnmounted(()=>{clearInterval(poller);clearInterval(progressPoller);clearInterv
                 <span>case 覆盖 <b>{{selectedRun.metrics.cases_passed || 0}} / {{selectedRun.metrics.cases_total || 0}}</b></span>
                 <span>声明用例 <b>{{selectedRun.metrics.cases_declared || 0}}</b></span>
                 <span>覆盖率 <b>{{selectedRun.metrics.case_coverage === null || selectedRun.metrics.case_coverage === undefined ? 'N/A' : percent(selectedRun.metrics.case_coverage)}}</b></span>
-                <span>RC 口径 <b>{{selectedRun.metrics.rc_mode==='official_source_compile'?'官方：候选函数单独编译':'旧结果：候选+harness 整体编译'}}</b></span>
-                <span>Harness 整体编译率 <b>{{percent(selectedRun.metrics.rc_harness)}}</b></span>
                 <span>编辑相似度 <b>{{percent(selectedRun.metrics.edit_similarity)}}</b><small v-if="selectedRun.metrics.edit_similarity_samples"> · {{selectedRun.metrics.edit_similarity_samples}} 个样本</small></span>
                 <span>不可诊断样本 <b>{{selectedRun.metrics.unsupported_samples || 0}}</b></span>
                 <span>未覆盖用例 <b>{{selectedRun.metrics.uncovered_cases || 0}}</b></span>

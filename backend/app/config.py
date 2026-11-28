@@ -29,6 +29,13 @@ def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 4096) -> 
 ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = Path(os.getenv('DEC_EVAL_DATA_DIR', str(ROOT / 'storage'))).resolve()
 DB_FILE = DATA_DIR / 'decompile_eval.sqlite3'
+# Server-side JSONL import roots.  Files outside these roots are never exposed.
+_server_import_env = os.getenv('DEC_EVAL_SERVER_IMPORT_DIRS', '').strip()
+if _server_import_env:
+    SERVER_IMPORT_DIRS = [Path(p).expanduser().resolve()
+                          for p in _server_import_env.split(os.pathsep) if p.strip()]
+else:
+    SERVER_IMPORT_DIRS = [ROOT / 'data' / 'import', ROOT / 'data' / 'staging']
 SANDBOX_IMAGE = os.getenv('DEC_EVAL_SANDBOX_IMAGE', 'gcc:14')
 CORS_ORIGINS = os.getenv('DEC_EVAL_CORS_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(',')
 MAX_UPLOAD_BYTES = 64 * 1024 * 1024  # offline predictions only
@@ -89,6 +96,10 @@ LOG_LIMIT_BYTES = _env_int('DEC_EVAL_LOG_LIMIT_BYTES', 32 * 1024, 1024, 1024 * 1
 # ---------------------------------------------------------------------------
 # Local vLLM deployment management and GPU monitoring.
 # ---------------------------------------------------------------------------
+HOST_CC = os.getenv('DEC_EVAL_HOST_CC', 'gcc')
+HOST_CXX = os.getenv('DEC_EVAL_HOST_CXX', 'g++')
+ALLOW_HOST_EXECUTION = os.getenv('DEC_EVAL_ALLOW_HOST_EXECUTION', '1').strip().lower() not in ('0', 'false', 'no')
+
 VLLM_BIN = os.getenv('DEC_EVAL_VLLM_BIN', '/home/jiang/venvs/vllm/bin/vllm')
 ALLOW_DEPLOY = os.getenv('DEC_EVAL_ALLOW_DEPLOY', '1').strip().lower() not in ('0', 'false', 'no')
 ADMIN_TOKEN = os.getenv('DEC_EVAL_ADMIN_TOKEN', '').strip()

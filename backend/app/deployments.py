@@ -148,6 +148,12 @@ def validate_deployment(data: dict) -> dict:
         raise DeploymentError('max_num_batched_tokens must be 1–1,000,000')
     if not (0.05 <= utilization <= 0.99):
         raise DeploymentError('gpu_memory_utilization must be 0.05–0.99')
+    seed = int(_number('seed', 0))
+    if not (0 <= seed <= 2_147_483_647):
+        raise DeploymentError('seed must be between 0 and 2147483647')
+    deterministic = bool(data.get('deterministic', True))
+    disable_prefix_caching = bool(data.get('disable_prefix_caching', True))
+    enforce_eager = bool(data.get('enforce_eager', False))
 
     gpu_ids = _parse_gpu_ids(data.get('gpu_ids'))
     count = gpu.device_count()
@@ -184,6 +190,9 @@ def validate_deployment(data: dict) -> dict:
         'max_model_len': max_model_len, 'max_num_seqs': max_num_seqs,
         'max_num_batched_tokens': max_num_batched_tokens,
         'gpu_memory_utilization': utilization,
+        'deterministic': deterministic, 'seed': seed,
+        'disable_prefix_caching': disable_prefix_caching,
+        'enforce_eager': enforce_eager,
         'base_url': f'http://127.0.0.1:{port}/v1',
     }
 
@@ -203,6 +212,11 @@ def build_command(spec: dict) -> list[str]:
     ]
     if len(gpu_ids) > 1:
         command += ['--tensor-parallel-size', str(len(gpu_ids))]
+    command += ['--seed', str(spec.get('seed', 0))]
+    if spec.get('disable_prefix_caching'):
+        command += ['--no-enable-prefix-caching']
+    if spec.get('enforce_eager'):
+        command += ['--enforce-eager']
     return command
 
 
@@ -387,8 +401,12 @@ def _spawn(deployment: dict) -> subprocess.Popen:
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(deployment['gpu_ids'])
     env['PYTHONUNBUFFERED'] = '1'
+    if deployment.get('deterministic'):
+        env['VLLM_BATCH_INVARIANT'] = '1'
     _write_log(log_path, f'[deploye] starting: {json.dumps(command, ensure_ascii=False)}')
     _write_log(log_path, f'[deploye] CUDA_VISIBLE_DEVICES={env["CUDA_VISIBLE_DEVICES"]}')
+    if env.get('VLLM_BATCH_INVARIANT'):
+        _write_log(log_path, f'[deploye] VLLM_BATCH_INVARIANT={env["VLLM_BATCH_INVARIANT"]}')
     with log_path.open('ab') as log:
         process = subprocess.Popen(
             command, stdout=log, stderr=subprocess.STDOUT,
@@ -405,26 +423,33 @@ def start_deployment(data: dict, deployment_id: int | None = None) -> dict:
                 deployment_id = db.execute('''INSERT INTO deployments
                     (name,served_name,model_path,gpu_ids,port,dtype,max_model_len,
                      max_num_seqs,max_num_batched_tokens,gpu_memory_utilization,
+                     deterministic,seed,disable_prefix_caching,enforce_eager,
                      api_mode,managed,base_url,status,created_at,config_json)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                     (spec['name'], spec['served_name'], spec['model_path'],
                      spec['gpu_ids'], spec['port'], spec['dtype'],
                      spec['max_model_len'], spec['max_num_seqs'],
                      spec['max_num_batched_tokens'], spec['gpu_memory_utilization'],
+                     int(spec['deterministic']), spec['seed'],
+                     int(spec['disable_prefix_caching']), int(spec['enforce_eager']),
                      spec['api_mode'], 1, spec['base_url'], 'starting', now(),
                      json.dumps(spec, ensure_ascii=False))).lastrowid
         log_path = str(_log_path(deployment_id))
         with connect() as db:
             db.execute('''UPDATE deployments SET name=?,served_name=?,model_path=?,
                 gpu_ids=?,port=?,dtype=?,max_model_len=?,max_num_seqs=?,
-                max_num_batched_tokens=?,gpu_memory_utilization=?,api_mode=?,
-                base_url=?,managed=1,status='starting',error='',log_path=?,
+                max_num_batched_tokens=?,gpu_memory_utilization=?,
+                deterministic=?,seed=?,disable_prefix_caching=?,enforce_eager=?,
+                api_mode=?,base_url=?,managed=1,status='starting',error='',log_path=?,
                 stopped_at=NULL,config_json=?,created_at=COALESCE(created_at,?)
                 WHERE id=?''',
                 (spec['name'], spec['served_name'], spec['model_path'],
                  spec['gpu_ids'], spec['port'], spec['dtype'], spec['max_model_len'],
                  spec['max_num_seqs'], spec['max_num_batched_tokens'],
-                 spec['gpu_memory_utilization'], spec['api_mode'], spec['base_url'],
+                 spec['gpu_memory_utilization'],
+                 int(spec['deterministic']), spec['seed'],
+                 int(spec['disable_prefix_caching']), int(spec['enforce_eager']),
+                 spec['api_mode'], spec['base_url'],
                  log_path, json.dumps(spec, ensure_ascii=False), now(), deployment_id))
             deployment = dict(db.execute('SELECT * FROM deployments WHERE id=?',
                                          (deployment_id,)).fetchone())

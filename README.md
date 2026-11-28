@@ -8,7 +8,7 @@
 
 ## 一、已实现功能
 
-- **数据集管理**：导入统一 JSONL（默认不限制文件字节数、最多 100000 条样本），查看样本与 O0/O1/O2/O3，并删除无评测任务的数据集；支持 C/C++。
+- **数据集管理**：导入统一 JSONL（默认不限制文件字节数、最多 100000 条样本）；文件来源可选「本地上传」或「服务器文件」，共用同一套校验和流式导入；查看样本与 O0/O1/O2/O3，并删除无评测任务的数据集；支持 C/C++。
 - **模型管理**：OpenAI 兼容接口（vLLM Completion / Chat），API Key 仅从后端环境变量读取。
 - **离线评测**：导入已有 `sample_id` + `prediction`，不重新推理。
 - **参考源码基线**：用**完全相同的编译器、测试程序、Docker 环境**执行数据集自带的 `reference_source`，结果保存为独立任务；失败表示数据集/环境问题，而不是模型错误。
@@ -20,6 +20,7 @@
 - **真实 TCP**：tree-sitter 解析官方 C/C++ harness 的每个 `assert`，动态循环断言按运行时实例展开；首个断言失败后仍独立诊断后续用例；官方完整 harness 仍是 RE 唯一裁决。
 - **逐用例结果**：输入/期望/实际、比较表达式、退出码/信号、stdout/stderr、耗时、来源与诊断状态全部入库；无法可靠序列化时值为 null 并标注，不编造。
 - **AUTO 推理**：`INFERENCE_CONCURRENCY=0` 时使用有界动态水位持续投递，任一请求完成立即补位，不等待整批；连接池与待编译队列均有资源上限。
+- **宿主机快速模式（可选）**：显式开启后跳过 Docker，直接使用本机 gcc/g++，适合可信本地快速迭代；默认仍使用 Docker。
 - **编译资源保护**：默认 64，按 `/proc/meminfo` 可用内存与 CPU 自动收缩实际值，前端显示请求值与实际值。
 - **持久化与恢复**：逐样本结果即时写 SQLite；支持取消、重试、断点续跑；已完成样本不会重复评测。
 - **诊断日志**：容器内 Python runner 输出结构化 JSON；保留编译/测试 stdout、stderr、退出码、信号、超时、耗时和截断标记。
@@ -148,6 +149,9 @@ CUDA_VISIBLE_DEVICES=0 vllm serve /path/to/llm4decompile-1.3b-v1.5 \
 | `TEST_TIMEOUT` | 10 | 单个测试用例运行超时（秒） |
 | `MAX_MODEL_LEN` | 4096 | 模型上下文；输入+输出超过即 `INPUT_TOO_LONG` |
 | `DEC_EVAL_MAX_DATASET_UPLOAD_BYTES` | 0 | 数据集上传字节上限；0=不限制（仍最多 100000 条样本） |
+| `DEC_EVAL_SERVER_IMPORT_DIRS` | `data/import:data/staging` | 服务器端可选 JSONL 目录，`:` 分隔；不在目录内的路径一律拒绝 |
+| `DEC_EVAL_ALLOW_HOST_EXECUTION` | 1 | 是否允许宿主机快速编译模式；每次任务仍需显式勾选风险确认；生产环境建议设为 0 |
+| `DEC_EVAL_HOST_CC` / `DEC_EVAL_HOST_CXX` | gcc / g++ | 宿主机快速模式编译器 |
 | `TOKENIZER_TIMEOUT` | 10 | vLLM `/tokenize` 超时 |
 | `DEC_EVAL_BATCH_MODEL_PATH` | 空 | 离线批量模式的本地模型路径 |
 | `DEC_EVAL_BATCH_SIZE` | 32 | 离线批量每轮样本数 |
@@ -299,6 +303,8 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 | GET | `/api/overview` | 计数概览 |
 | GET/POST | `/api/datasets`, `/api/datasets/import` | 数据集 |
 | GET | `/api/datasets/{id}/samples` | 样本列表 |
+| GET | `/api/datasets/server-files` | 列出允许目录中的服务器端 `.jsonl` 文件 |
+| POST | `/api/datasets/import-server` | 从服务器允许目录导入 JSONL（body: `name/version/description/path`） |
 | DELETE | `/api/datasets/{id}` | 删除数据集及其样本（已有评测任务时 409，需先删除任务） |
 | POST | `/api/datasets/{id}/reference-check` | 创建参考源码基线任务（body: `optimizations`, `sample_limit`, `compile_concurrency`） |
 | POST | `/api/datasets/{id}/exebench-oracle?sample_limit=20` | 批量验证 ExeBench 参考源码 / wrapper，写入 Oracle 状态 |
@@ -358,7 +364,7 @@ micro 与 macro 相等可以是真实结果，不强制制造差异。
 cd decompile-eval-mvp/backend
 source .venv/bin/activate
 python -m pytest -q
-# 159 passed, 18 skipped（Docker 用例默认跳过）
+# 168 passed, 18 skipped（Docker 用例默认跳过）
 ```
 
 注意：必须用 `python -m pytest`（让 `backend/` 进入 `sys.path`）；直接 `pytest` 可能报 `No module named 'app'`。
@@ -456,7 +462,8 @@ curl -s http://127.0.0.1:8010/api/runs/1/progress   # token_rate/eval_rate/elaps
 
 - 网页选择本地模型路径、GPU、端口、dtype、`max-model-len`、`max-num-seqs`、`max-num-batched-tokens`、`gpu-memory-utilization`、接口类型，一键启动独立 vLLM 进程。
 - 固定使用 `/home/jiang/venvs/vllm/bin/vllm`（可用 `DEC_EVAL_VLLM_BIN` 覆盖），参数以 argv 列表传递，**`shell=False`**。
-- 部署列表展示状态、PID、端点、GPU/端口、启动日志、最新请求数/Token 吞吐；支持停止（保留配置可重启）、重启，以及 **取消部署**（停止托管进程并移除部署记录；外部服务只取消监控，不停止外部进程）。
+- 确定性部署参数：`deterministic`（设置 `VLLM_BATCH_INVARIANT=1`）、`seed`、`disable_prefix_caching`、`enforce_eager`；用于让同一请求在不同并发下尽量得到相同输出。
+- 部署列表展示状态、PID、端点、GPU/端口、确定性参数、启动日志、最新请求数/Token 吞吐；支持停止（保留配置可重启）、重启，以及 **取消部署**（停止托管进程并移除部署记录；外部服务只取消监控，不停止外部进程）。
 - 部署成功自动写入现有 `models` 表（同一 `deployment_id` 更新，不重复建模型），评测页可直接选择。
 - 配置持久化到 `deployments`；后端重启后通过 PID + `/proc/<pid>/cmdline` 校验恢复管理，不误杀 PID 复用进程。
 - 外部 vLLM 服务可注册和监控；`managed=0`，stop/restart 返回 409，绝不停止外部进程。
@@ -499,6 +506,25 @@ curl -X POST http://127.0.0.1:8010/api/deployments \
        "max_num_seqs":64,"max_num_batched_tokens":8192,
        "gpu_memory_utilization":0.7,"api_mode":"completion"}'
 ```
+
+### 让 vLLM 输出可复现
+
+部署表单新增：
+
+- **确定性输出（deterministic）**：启动子进程时设置 `VLLM_BATCH_INVARIANT=1`；
+- **随机种子 seed**：传给 vLLM `--seed`；
+- **禁用 prefix caching**：传 `--no-enable-prefix-caching`；
+- **enforce eager**：传 `--enforce-eager`（更稳定，但更慢）。
+
+这些参数会持久化并参与重启恢复。实际评测还应使用：
+
+```text
+temperature=0
+top_p=1 / top_k=1
+固定模型部署参数（max-num-seqs / max-num-batched-tokens）
+```
+
+如果使用采样（temperature>0），还需要在请求参数中显式传入相同 seed。批量不变模式不是零成本，通常会降低吞吐，启用后应重新做性能基线。
 
 环境变量：`DEC_EVAL_VLLM_BIN`、`DEC_EVAL_ALLOW_DEPLOY`、`DEC_EVAL_ADMIN_TOKEN`、`DEC_EVAL_DEPLOY_START_TIMEOUT`、`DEC_EVAL_DEPLOY_STOP_TIMEOUT`、`DEC_EVAL_DEPLOY_MAX_RUNNING`、`DEC_EVAL_GPU_MONITOR`、`DEC_EVAL_GPU_INTERVAL`、`DEC_EVAL_GPU_HISTORY`。
 
@@ -559,7 +585,39 @@ python scripts/convert_decompile_eval.py --subset exebench --compiler clang \
 - 5 条 Clang O0 重新编译样本：Oracle 5/5；
 - Docker 集成测试覆盖 dummy_funcs 分组、非法 JSON 输出、错误 expected output。
 
-## 十六、已知限制
+## 十六、宿主机快速模式（可选）
+
+Docker 仍是默认执行方式。为避开每个样本启动容器的固定开销，可在新建评测时选择：
+
+```text
+编译执行环境：宿主机 gcc/g++ 快速（无隔离）
+```
+
+同时必须勾选风险确认。服务端开关默认开启（可用环境变量关闭）：
+
+```bash
+export DEC_EVAL_ALLOW_HOST_EXECUTION=1   # 显式开启；设为 0 可禁用
+# 可选：自定义编译器
+export DEC_EVAL_HOST_CC=gcc
+export DEC_EVAL_HOST_CXX=g++
+```
+
+使用宿主机模式时：
+
+- 编译和执行都由后端进程直接调用本机 `gcc` / `g++`；
+- 宿主机模式也会执行 tree-sitter 逐用例诊断（官方 harness + `program_diag`），因此 TCP micro/macro 正常显示；诊断编译/运行同样在宿主机完成。
+- 宿主机 RC 现在与 Docker 的官方口径一致：候选函数单独编译成功才算 RC；完整 harness 失败仍记 RE=0。
+- 前端在宿主机模式选择区显示 `gcc --version` / `g++ --version`，并调用 `GET /api/host-toolchain`；run config 会保存版本快照，任务详情可查看当时使用的 GCC 版本；
+- 不启动 Docker；
+- 仍然保留编译/测试超时、进程组清理、CPU/文件大小/文件描述符 rlimit；
+- **没有 Docker 的 network none、只读根文件系统、非 root、PID 命名空间等隔离**，只适合可信本地环境；
+- ExeBench 需要官方 C++ wrapper 和固定依赖，当前不支持宿主机快速模式，接口会返回 422，仍使用 Docker；
+- 宿主机模式先执行候选源码单独编译（`gcc -S` + gnu11 兼容 flags）得到官方 RC，再执行完整 harness；历史宿主机任务如果没有 source 字段，仍显示旧口径。
+- 宿主机模式的 TCP 来自逐断言诊断用例；如果 harness 不可拆分，仍显示 TCP=N/A。
+
+实测演示数据集 4 个样本，宿主机编译约 40ms/样本、测试约 7ms/样本，`sandbox_ms` 约 50ms/样本；Docker 路径通常需要数秒/样本。该模式只用于开发期快速迭代，不应作为公网/多租户的评测后端。
+
+## 十七、已知限制
 
 1. 单机、单进程、一次一个任务；跨机/多任务并发需 Redis/RQ 等（本版不强求）。
 2. 离线批量模式要求后端 Python 环境安装 `vllm`，且 `LLM.generate` 是同步 GPU 调用；批次执行中不能被取消，只在批次边界检查取消/背压。
@@ -578,7 +636,7 @@ python scripts/convert_decompile_eval.py --subset exebench --compiler clang \
 15. GPU 监控依赖 NVIDIA 驱动与 nvidia-ml-py；无驱动/容器内无 `/dev/nvidia*` 时 `/api/gpus` 返回 available=false，部署功能仍可用但无 GPU 曲线（本项目的自动化测试用 fake NVML，真实 vLLM 启动需在有 GPU 的主机后端执行）。
 16. 部署管理默认只允许可信本地管理员；跨机器/多租户部署需要额外鉴权、资源配额与进程隔离。
 
-## 十七、项目结构
+## 十八、项目结构
 
 ```text
 backend/
